@@ -1,8 +1,6 @@
 {
   "name": "bot-consultorio",
   "version": "1.0.0",
-  "description": "Bot de WhatsApp para consultorio ginecológico",
-  "main": "index.js",
   "type": "module",
   "scripts": {
     "start": "node index.js"
