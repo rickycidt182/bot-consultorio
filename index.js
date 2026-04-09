@@ -67,3 +67,53 @@ app.post("/whatsapp", async (req, res) => {
       body: JSON.stringify({
         model: "gpt-4o-mini",
         messages: [{ role: "system", content: SYSTEM_PROMPT }, ...historial],
+        max_tokens: 300,
+        temperature: 0.7,
+      }),
+    });
+
+    console.log("📊 OpenAI status:", openaiRes.status);
+
+    const data = await openaiRes.json();
+
+    if (!openaiRes.ok) {
+      console.error("❌ Error OpenAI:", JSON.stringify(data));
+      return res.status(200).send(xmlResponse("Falla temporal. Intenta de nuevo en un momento 😊"));
+    }
+
+    const reply = data.choices?.[0]?.message?.content?.trim()
+      || "Hola 😊 ¿En qué puedo ayudarte hoy?";
+
+    historial.push({ role: "assistant", content: reply });
+    console.log("✅ Respondiendo:", reply);
+
+    return res.status(200).send(xmlResponse(reply));
+
+  } catch (err) {
+    console.error("❌ Error:", err.message);
+    return res.status(200).send(xmlResponse("Falla temporal. Intenta de nuevo en un momento 😊"));
+  }
+});
+
+function xmlResponse(msg) {
+  return `<Response><Message>${escapeXml(msg)}</Message></Response>`;
+}
+
+function escapeXml(str = "") {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+const PORT = process.env.PORT || 3000;
+const server = app.listen(PORT, "0.0.0.0", () => {
+  console.log(`✅ Servidor corriendo en puerto ${PORT}`);
+  console.log(`🔑 OPENAI_API_KEY configurada: ${!!OPENAI_API_KEY}`);
+});
+
+// Aumentar timeouts para Railway
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 120000;
