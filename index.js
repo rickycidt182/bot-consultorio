@@ -1,34 +1,33 @@
-import http from "http";
+import { createServer } from "node:http";
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 
-const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Message>Hola 😊 Ya quedó conectado el bot.</Message>
-</Response>`;
-
-const server = http.createServer((req, res) => {
-  console.log("REQ:", req.method, req.url);
-
-  if (req.method === "GET" && req.url === "/") {
-    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-    res.end("Servidor activo ✅");
+const server = createServer((req, res) => {
+  if (req.url === "/" && req.method === "GET") {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/plain");
+    res.end("OK");
     return;
   }
 
   if (
-    req.method === "POST" &&
-    (req.url === "/whatsapp" || req.url === "/whatsapp/")
+    (req.url === "/whatsapp" || req.url === "/whatsapp/") &&
+    req.method === "POST"
   ) {
-    res.writeHead(200, { "Content-Type": "text/xml; charset=utf-8" });
-    res.end(xml);
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/xml");
+    res.end(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Message>OK</Message>
+</Response>`);
     return;
   }
 
-  res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+  res.statusCode = 404;
+  res.setHeader("Content-Type", "text/plain");
   res.end("Not found");
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Servidor corriendo en puerto ${PORT}`);
+  console.log("Server listening on", PORT);
 });
