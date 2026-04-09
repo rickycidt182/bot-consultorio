@@ -1,33 +1,32 @@
-import { createServer } from "node:http";
+import http from "http";
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = process.env.PORT || 8080;
 
-const server = createServer((req, res) => {
-  if (req.url === "/" && req.method === "GET") {
-    res.statusCode = 200;
-    res.setHeader("Content-Type", "text/plain");
-    res.end("OK");
-    return;
+const server = http.createServer((req, res) => {
+  console.log("REQ:", req.method, req.url);
+
+  // ROOT (para Railway healthcheck)
+  if (req.method === "GET" && req.url === "/") {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    return res.end("OK");
   }
 
-  if (
-    (req.url === "/whatsapp" || req.url === "/whatsapp/") &&
-    req.method === "POST"
-  ) {
-    res.statusCode = 200;
-    res.setHeader("Content-Type", "text/xml");
-    res.end(`<?xml version="1.0" encoding="UTF-8"?>
+  // TWILIO WEBHOOK
+  if (req.method === "POST" && req.url.startsWith("/whatsapp")) {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Message>OK</Message>
-</Response>`);
-    return;
+  <Message>Hola 😊 Ya quedó conectado el bot.</Message>
+</Response>`;
+
+    res.writeHead(200, { "Content-Type": "text/xml" });
+    return res.end(xml);
   }
 
-  res.statusCode = 404;
-  res.setHeader("Content-Type", "text/plain");
-  res.end("Not found");
+  // RESPUESTA GLOBAL (IMPORTANTE)
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("OK");
 });
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Server listening on", PORT);
+  console.log(`Servidor corriendo en puerto ${PORT}`);
 });
