@@ -36,42 +36,44 @@ TONO:
 - Tipo WhatsApp
 - Humano
 
+ESTILO:
+- Usa mensajes cortos por defecto
+- Si la paciente está preocupada, puedes explicar un poco más
+- Siempre busca avanzar la conversación hacia una decisión concreta
+- No sonar como robot
+
 REGLAS:
 - No des diagnósticos definitivos
 - No recetes medicamentos
 - No cambies tratamientos
 - No prometas resultados
-- Siempre termina con una acción concreta si hay interés
+- Si la conversación ya va hacia cita, no abras opciones innecesarias
 
 PRECIO:
 - Si preguntan precio, NO lo des en el primer mensaje
 - Primero conecta y pregunta brevemente el motivo
-- Luego menciona valor
-- El precio solo se da si:
+- Luego menciona el valor de la consulta
+- Da el precio solo si:
   1. la paciente insiste
   2. ya mostró interés real
-  3. ya se llevó la conversación hacia la cita
+  3. ya está cerca de decidir
 
 CIERRE:
-- Nunca dejes decisiones abiertas si la paciente ya mostró interés
-- No digas “avísame”
-- Mejor ofrece 2 horarios concretos
+- Nunca cierres con “avísame”
+- Siempre intenta cerrar con una acción concreta
+- Ofrece 2 horarios concretos cuando corresponda
 
 HORARIOS:
-- lunes, miércoles y viernes
-- de 3:30 PM a 9:30 PM
-- duración de consulta: 30 minutos
+- Lunes, miércoles y viernes
+- 3:30 PM a 9:30 PM
+- duración 30 minutos
 
-PRIORIDAD:
-Si detectas parto, cesárea, urgencia, sangrado abundante, dolor intenso, emergencia o quiere hablar con el doctor:
+URGENCIAS:
+Si detectas parto, cesárea, urgencia, sangrado abundante, dolor intenso,
+no se mueve el bebé, fiebre importante o quiere hablar directo con el doctor:
 - responde con prioridad
 - no manejes como cita normal
 - indica que será canalizada directamente
-
-ESTILO:
-- Respuestas breves por defecto
-- Si la paciente está confundida o ansiosa, puedes explicar un poco más
-- Aun así, lleva a acción
 
 NO DIGAS QUE ERES IA.
 `;
@@ -130,6 +132,7 @@ function isGreeting(text) {
     "hola",
     "buenas",
     "buenas tardes",
+    "buenas noches",
     "buen día",
     "buen dia",
     "ok",
@@ -158,6 +161,8 @@ function detectPriorityByRules(text) {
     "dolor fuerte",
     "dolor insoportable",
     "emergencia",
+    "no se mueve mi bebe",
+    "no se mueve mi bebé",
     "quiero hablar con el doctor",
     "quiero hablar directo con el doctor",
     "linea directa",
@@ -178,6 +183,8 @@ function detectPriceQuestionByRules(text) {
     "cuánto sale",
     "precio consulta",
     "costo consulta",
+    "que costo tiene",
+    "qué costo tiene",
   ].some((k) => t.includes(k));
 }
 
@@ -199,7 +206,15 @@ function detectAppointmentIntentByRules(text) {
     t.includes("me gustaria agendar") ||
     t.includes("necesito una cita") ||
     t.includes("quiero una cita") ||
-    t.includes("quisiera una cita")
+    t.includes("quisiera una cita") ||
+    t.includes("qué horario tiene") ||
+    t.includes("que horario tiene") ||
+    t.includes("qué horarios tiene") ||
+    t.includes("que horarios tiene") ||
+    t.includes("qué disponibilidad tiene") ||
+    t.includes("que disponibilidad tiene") ||
+    t.includes("horario para atender") ||
+    t.includes("horario para consulta")
   );
 }
 
@@ -301,7 +316,9 @@ function pickSlotsByPreference(preferredDay = "", preferredTime = "", avoid = []
   let slots = getAllBaseSlots().filter((s) => !avoid.includes(s));
 
   if (preferredDay) {
-    slots = slots.filter((s) => s.toLowerCase().includes(preferredDay.toLowerCase()));
+    slots = slots.filter((s) =>
+      s.toLowerCase().includes(preferredDay.toLowerCase())
+    );
   }
 
   if (preferredTime === "tarde") {
@@ -359,7 +376,11 @@ function buildPriceQualificationReply() {
 }
 
 function buildPriceReplyWithClose(state, preferredDay = "", preferredTime = "") {
-  const [a, b] = pickSlotsByPreference(preferredDay, preferredTime, state.lastOfferedSlots);
+  const [a, b] = pickSlotsByPreference(
+    preferredDay,
+    preferredTime,
+    state.lastOfferedSlots
+  );
   state.lastOfferedSlots = [a, b];
 
   return `La consulta incluye valoración completa y ultrasonido 😊
@@ -374,7 +395,11 @@ function buildAskForAppointmentData(state, preferredDay = "", preferredTime = ""
 
   if (missing.length === 0) {
     state.stage = "esperando_horario";
-    const [a, b] = pickSlotsByPreference(preferredDay, preferredTime, state.lastOfferedSlots);
+    const [a, b] = pickSlotsByPreference(
+      preferredDay,
+      preferredTime,
+      state.lastOfferedSlots
+    );
     state.lastOfferedSlots = [a, b];
     return `Perfecto 😊
 
@@ -399,7 +424,11 @@ Me los puedes mandar en un solo mensaje por favor.`;
 }
 
 function buildAlternativeSlots(state, preferredDay = "", preferredTime = "") {
-  const [a, b] = pickSlotsByPreference(preferredDay, preferredTime, state.lastOfferedSlots);
+  const [a, b] = pickSlotsByPreference(
+    preferredDay,
+    preferredTime,
+    state.lastOfferedSlots
+  );
   state.lastOfferedSlots = [a, b];
 
   return `Claro 😊
@@ -482,9 +511,12 @@ async function classifyTurnWithOpenAI(state, incomingMsg) {
   }));
 
   const classifierPrompt = `
-Analiza el mensaje de una paciente de consultorio ginecológico usando el mensaje actual y el contexto reciente.
+Analiza el mensaje de una paciente de consultorio ginecológico usando:
+- el mensaje actual
+- el contexto reciente
+- la etapa actual
 
-Debes tolerar:
+Tolera:
 - faltas de ortografía
 - frases incompletas
 - abreviaturas
@@ -497,7 +529,7 @@ Devuelve SOLO JSON válido con esta estructura exacta:
   "intent": "saludo|precio|cita|motivo|horario|datos_paciente|urgencia|hablar_doctor|general",
   "normalized_text": "string",
   "motive_detected": "string",
-  "wants_price": true,
+  "wants_price": false,
   "wants_appointment": false,
   "is_priority": false,
   "wants_doctor_direct": false,
@@ -512,11 +544,15 @@ Devuelve SOLO JSON válido con esta estructura exacta:
 }
 
 Reglas:
-- "quisiera agendar una cita" => intent "cita"
-- "embarazo", "revision", "dolor", "sangrado" => intent "motivo"
+- "quisiera agendar una cita" => intent "cita", wants_appointment true
+- "que horario tiene para atender" => intent "cita", wants_appointment true
+- "embarazo" => intent "motivo", motive_detected "embarazo"
 - "lunes más tarde" => intent "horario", asks_later_slot true, preferred_day lunes, preferred_time tarde
-- "quiero hablar con el doctor", "cesarea", "parto", "urgente" => is_priority true
-- si ya antes dijo el motivo y luego pregunta precio, wants_price true y motive_detected puede repetirse
+- "que costo tiene" => intent "precio", wants_price true
+- "no se mueve mi bebe" => is_priority true
+- "quiero hablar con el doctor" => wants_doctor_direct true, is_priority true
+- si ya antes dijo el motivo y luego pregunta precio, wants_price true
+- si ya antes pidió cita y ahora manda "hola", no reinicies, interpreta según la etapa
 - si no hay dato, devuelve string vacío
 
 No expliques nada fuera del JSON.
@@ -565,7 +601,10 @@ async function askOpenAIWriter(state, message) {
     state.messages.splice(0, state.messages.length - 16);
   }
 
-  return reply || "Hola 😊 Con gusto te ayudo. ¿Buscas revisión ginecológica, control de embarazo o agendar una cita?";
+  return (
+    reply ||
+    "Hola 😊 Con gusto te ayudo. ¿Buscas revisión ginecológica, control de embarazo o agendar una cita?"
+  );
 }
 
 function mergeClassifierDataIntoState(state, cls, fromPhone) {
@@ -628,7 +667,11 @@ Ya quedó marcado como prioridad para que el doctor lo revise directamente.`,
   if (state.stage === "esperando_motivo") {
     if (state.patient.motivo || cls?.intent === "motivo") {
       state.stage = "esperando_horario";
-      const [a, b] = pickSlotsByPreference(cls?.preferred_day || "", cls?.preferred_time || "", state.lastOfferedSlots);
+      const [a, b] = pickSlotsByPreference(
+        cls?.preferred_day || "",
+        cls?.preferred_time || "",
+        state.lastOfferedSlots
+      );
       state.lastOfferedSlots = [a, b];
 
       return {
@@ -661,7 +704,11 @@ Para ayudarte a agendar, ¿me compartes brevemente el motivo de la consulta?`,
 
     if (missing.length === 0) {
       state.stage = "esperando_horario";
-      const [a, b] = pickSlotsByPreference(cls?.preferred_day || "", cls?.preferred_time || "", state.lastOfferedSlots);
+      const [a, b] = pickSlotsByPreference(
+        cls?.preferred_day || "",
+        cls?.preferred_time || "",
+        state.lastOfferedSlots
+      );
       state.lastOfferedSlots = [a, b];
       return {
         reply: `Perfecto 😊
@@ -685,7 +732,11 @@ Tengo disponible ${a} o ${b}, ¿cuál te queda mejor?`,
     if ((detectPriceQuestionByRules(incomingMsg) || cls?.wants_price) && state.patient.motivo) {
       state.flags.yaDimosPrecio = true;
       return {
-        reply: buildPriceReplyWithClose(state, cls?.preferred_day || "", cls?.preferred_time || ""),
+        reply: buildPriceReplyWithClose(
+          state,
+          cls?.preferred_day || "",
+          cls?.preferred_time || ""
+        ),
         handled: true,
       };
     }
@@ -702,13 +753,23 @@ Tengo disponible ${a} o ${b}, ¿cuál te queda mejor?`,
       cls?.asks_later_slot
     ) {
       return {
-        reply: buildAlternativeSlots(state, cls?.preferred_day || "", cls?.preferred_time || ""),
+        reply: buildAlternativeSlots(
+          state,
+          cls?.preferred_day || "",
+          cls?.preferred_time || ""
+        ),
         handled: true,
       };
     }
 
-    if (cls?.accepted_slot_text || /lunes|miércoles|miercoles|viernes|3:30|4:00|4:30|5:00|5:30|6:00|6:30|7:00|7:30|8:00|8:30|9:00/i.test(incomingMsg)) {
-      state.patient.horarioElegido = cls?.accepted_slot_text?.trim() || incomingMsg.trim();
+    if (
+      cls?.accepted_slot_text ||
+      /lunes|miércoles|miercoles|viernes|3:30|4:00|4:30|5:00|5:30|6:00|6:30|7:00|7:30|8:00|8:30|9:00/i.test(
+        incomingMsg
+      )
+    ) {
+      state.patient.horarioElegido =
+        cls?.accepted_slot_text?.trim() || incomingMsg.trim();
       state.stage = "esperando_datos_cita";
 
       const missing = missingPatientFields(state);
@@ -747,7 +808,27 @@ Si quieres, en el siguiente paso te confirmamos la cita final.`,
     };
   }
 
-  if (detectAppointmentIntentByRules(incomingMsg) || cls?.wants_appointment || cls?.intent === "cita") {
+  if (
+    detectAppointmentIntentByRules(incomingMsg) ||
+    cls?.wants_appointment ||
+    cls?.intent === "cita"
+  ) {
+    if (state.patient.motivo) {
+      state.stage = "esperando_horario";
+      const [a, b] = pickSlotsByPreference(
+        cls?.preferred_day || "",
+        cls?.preferred_time || "",
+        state.lastOfferedSlots
+      );
+      state.lastOfferedSlots = [a, b];
+      return {
+        reply: `Perfecto 😊
+
+Tengo disponible ${a} o ${b}, ¿cuál te queda mejor?`,
+        handled: true,
+      };
+    }
+
     state.stage = "esperando_motivo";
     return {
       reply: `Claro, con gusto te ayudo a agendar tu cita 😊
@@ -757,12 +838,43 @@ Si quieres, en el siguiente paso te confirmamos la cita final.`,
     };
   }
 
-  if ((detectPriceQuestionByRules(incomingMsg) || cls?.wants_price || cls?.intent === "precio") && !state.flags.yaDimosPrecio) {
+  if (
+    (cls?.intent === "horario" && (cls?.motive_detected || state.patient.motivo)) ||
+    (cls?.preferred_day && (cls?.motive_detected || state.patient.motivo))
+  ) {
+    if (!state.patient.motivo && cls?.motive_detected) {
+      state.patient.motivo = cls.motive_detected;
+    }
+
+    state.stage = "esperando_horario";
+    const [a, b] = pickSlotsByPreference(
+      cls?.preferred_day || "",
+      cls?.preferred_time || "",
+      state.lastOfferedSlots
+    );
+    state.lastOfferedSlots = [a, b];
+
+    return {
+      reply: `Perfecto 😊
+
+Tengo disponible ${a} o ${b}, ¿cuál te queda mejor?`,
+      handled: true,
+    };
+  }
+
+  if (
+    (detectPriceQuestionByRules(incomingMsg) || cls?.wants_price || cls?.intent === "precio") &&
+    !state.flags.yaDimosPrecio
+  ) {
     if (state.patient.motivo) {
       state.flags.yaDimosPrecio = true;
       state.stage = "esperando_horario";
       return {
-        reply: buildPriceReplyWithClose(state, cls?.preferred_day || "", cls?.preferred_time || ""),
+        reply: buildPriceReplyWithClose(
+          state,
+          cls?.preferred_day || "",
+          cls?.preferred_time || ""
+        ),
         handled: true,
       };
     }
@@ -780,7 +892,11 @@ Si quieres, en el siguiente paso te confirmamos la cita final.`,
       state.flags.yaDimosPrecio = true;
       state.stage = "esperando_horario";
       return {
-        reply: buildPriceReplyWithClose(state, cls?.preferred_day || "", cls?.preferred_time || ""),
+        reply: buildPriceReplyWithClose(
+          state,
+          cls?.preferred_day || "",
+          cls?.preferred_time || ""
+        ),
         handled: true,
       };
     }
@@ -879,12 +995,15 @@ const server = createServer(async (req, res) => {
       }
 
       if (shouldEscalateDoctor(incomingMsg, cls) || notifyDoctor) {
-        console.log("🚨 NOTIFICAR AL DOCTOR:", {
-          telefono: fromPhone,
-          mensaje: incomingMsg,
-          paciente: state.patient,
-          stage: state.stage,
-        });
+        console.log(
+          "🚨 NOTIFICAR AL DOCTOR:",
+          JSON.stringify({
+            telefono: fromPhone,
+            mensaje: incomingMsg,
+            paciente: state.patient,
+            stage: state.stage,
+          })
+        );
       }
 
       if (
@@ -893,7 +1012,10 @@ const server = createServer(async (req, res) => {
         state.patient.telefono &&
         state.patient.motivo
       ) {
-        console.log("📋 DATOS COMPLETOS PARA AGENDAR:", state.patient);
+        console.log(
+          "📋 DATOS COMPLETOS PARA AGENDAR:",
+          JSON.stringify(state.patient)
+        );
       }
 
       const xml = twiml(reply);
