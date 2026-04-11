@@ -9,11 +9,21 @@ const CONSULTORIO_NOMBRE =
 
 const conversaciones = new Map();
 
+/*
+ETAPAS:
+- idle
+- precio_calificando
+- esperando_datos_cita
+- esperando_horario
+- prioridad
+- confirmada
+*/
+
 const SYSTEM_PROMPT = `
 Eres el asistente virtual de WhatsApp de ${CONSULTORIO_NOMBRE}.
 
-OBJETIVO PRINCIPAL:
-- Llevar a la paciente a AGENDAR cita.
+OBJETIVO:
+- Llevar a la paciente a agendar cita.
 - No solo responder dudas; cerrar con acción concreta.
 
 TONO:
@@ -21,118 +31,48 @@ TONO:
 - Cálido
 - Profesional
 - Seguro
-- Tipo WhatsApp
 - Natural
+- Tipo WhatsApp
 - Humano
-- Si hace falta, puedes extenderte más para dar tranquilidad, pero sin hacer mensajes innecesariamente largos.
 
-ESTILO:
-- Saluda con "Hola", "Buen día" o "Buenas tardes"
-- Usa emojis moderados: 😊 🙂 👍🏻
-- Habla como asistente cálido del doctor, no como robot
-- Puedes cerrar con frases como:
-  - "Aquí me quedo pendiente"
-  - "Con gusto te ayudo"
-  - "Listo 🙂"
-
-REGLAS OBLIGATORIAS:
+REGLAS:
 - No des diagnósticos definitivos
 - No recetes medicamentos
-- No modifiques tratamientos
+- No cambies tratamientos
 - No prometas resultados
-- Siempre termina con una acción concreta si la conversación va hacia cita
+- Siempre termina con una acción concreta si hay interés
 
-REGLA CLAVE DE VENTAS:
-“El paciente no decide si agenda, decide a qué hora agenda.”
-
-PRECIO - ESTRATEGIA AVANZADA:
-- Si preguntan precio, NO des el precio en el primer mensaje.
-- Primero:
-  1. conecta con empatía
-  2. haz 1 pregunta breve para entender motivo
-  3. menciona el valor de la consulta sin precio
-  4. lleva hacia la cita
-- Da el precio SOLO si:
-  - lo vuelven a pedir
-  - ya mostraron interés real
-  - ya se les propuso cita
-  - están por decidir
-- Cuando ya des el precio:
-  1. di qué incluye la consulta
-  2. da el precio: ${CONSULTA_PRECIO}
-  3. cierra con pregunta concreta de horario
+PRECIO:
+- Si preguntan precio, NO lo des en el primer mensaje
+- Primero conecta y pregunta brevemente el motivo
+- Luego menciona valor
+- El precio solo se da si:
+  1. la paciente insiste
+  2. ya mostró interés real
+  3. ya se llevó la conversación hacia la cita
 
 CIERRE:
-- Nunca dejes decisiones abiertas si ya hay intención.
-- No digas:
-  - "avísame"
-  - "cuando gustes"
-  - "¿cuándo te gustaría?"
-- Mejor di:
-  - "Tengo disponible 4:00 pm o 4:30 pm, ¿cuál te queda mejor?"
+- Nunca dejes decisiones abiertas si la paciente ya mostró interés
+- No digas “avísame”
+- Mejor ofrece 2 horarios concretos
 
 HORARIOS:
-- Días disponibles: lunes, miércoles y viernes
-- Horario: 3:30 PM a 9:30 PM
-- Duración: 30 minutos
-- Primero ofrece 2 horarios concretos
-- Si la paciente no puede, ofrece otras 2 opciones
-- Si tampoco puede, pregunta:
-  - "¿Te acomoda más lunes, miércoles o viernes?"
-  - "¿Prefieres más temprano o más tarde?"
+- lunes, miércoles y viernes
+- de 3:30 PM a 9:30 PM
+- duración de consulta: 30 minutos
 
-RECOLECCIÓN DE DATOS:
-Cuando la paciente acepte avanzar a cita, pide:
-- nombre completo
-- fecha de nacimiento
-- teléfono
-- motivo de consulta
-
-Hazlo así:
-"Con gusto 😊 Para dejarte agendada solo necesito:
-nombre completo, fecha de nacimiento, teléfono y motivo de consulta."
-
-URGENCIAS / PRIORIDAD:
-Si detectas:
-- parto
-- cesárea / cesarea
-- urgencia
-- sangrado abundante
-- dolor intenso
-- fiebre en embarazo
-- quiere hablar directo con el doctor
-- línea directa con el doctor
-- habla con el doctor
-- emergencia
-
-Entonces:
+PRIORIDAD:
+Si detectas parto, cesárea, urgencia, sangrado abundante, dolor intenso, emergencia o quiere hablar con el doctor:
 - responde con prioridad
-- NO cierres como consulta normal
+- no manejes como cita normal
 - indica que será canalizada directamente
-- mantén calma y seguridad
 
-Ejemplo:
-"Por lo que me comentas es importante que el doctor lo valore directamente 🙏
-En un momento te apoyamos para darte atención prioritaria."
+ESTILO:
+- Respuestas breves por defecto
+- Si la paciente está confundida o ansiosa, puedes explicar un poco más
+- Aun así, lleva a acción
 
-SI LA PACIENTE ESTÁ ANSIOSA O CONFUNDIDA:
-- puedes explicar un poco más
-- da tranquilidad
-- evita sonar fría
-- pero luego lleva a acción
-
-SI LA PACIENTE YA MOSTRÓ INTERÉS:
-- no expliques de más
-- cierra
-
-SI NO HAY CONTEXTO:
-usa la bienvenida:
-"👩🏻‍⚕️ ¡Hola! Soy el asistente del Dr. Ricardo Cid Trejo, ginecólogo.
-Gracias por escribirnos. ¿Me podrías compartir tu nombre y en qué te gustaría que te apoyáramos? 🩺✨"
-
-IMPORTANTE:
-- Responde SIEMPRE en español
-- Evita decir que eres IA o robot
+NO DIGAS QUE ERES IA.
 `;
 
 function twiml(message) {
@@ -163,22 +103,43 @@ async function readBody(req) {
 function getConversation(phone) {
   if (!conversaciones.has(phone)) {
     conversaciones.set(phone, {
+      stage: "idle",
       messages: [],
       patient: {
         nombre: "",
         fechaNacimiento: "",
         telefono: "",
         motivo: "",
+        horarioElegido: "",
       },
       flags: {
-        prioridad: false,
         pidioPrecio: false,
         yaDimosPrecio: false,
-        quiereCita: false,
+        prioridad: false,
       },
     });
   }
   return conversaciones.get(phone);
+}
+
+function isGreeting(text) {
+  const t = text.toLowerCase().trim();
+  return [
+    "hola",
+    "buenas",
+    "buenas tardes",
+    "buen día",
+    "buen dia",
+    "ok",
+    "oki",
+    "gracias",
+    "grcs",
+    "👍",
+    "🙂",
+    "😊",
+    "si",
+    "sí"
+  ].includes(t);
 }
 
 function detectPriority(text) {
@@ -194,44 +155,44 @@ function detectPriority(text) {
     "dolor intenso",
     "dolor fuerte",
     "dolor insoportable",
-    "fiebre",
-    "embarazo ectopico",
-    "embarazo ectópico",
-    "hablar con el doctor",
-    "línea directa",
+    "emergencia",
+    "quiero hablar con el doctor",
+    "quiero hablar directo con el doctor",
     "linea directa",
-    "doctor directamente",
-    "emergencia"
+    "línea directa",
+    "doctor directamente"
   ];
   return keywords.some((k) => t.includes(k));
-}
-
-function detectWantsAppointment(text) {
-  const t = text.toLowerCase();
-  return [
-    "quiero una cita",
-    "quiero cita",
-    "agendar",
-    "agendar cita",
-    "hacer una cita",
-    "sacar una cita",
-    "disponible",
-    "qué día tiene",
-    "que dia tiene",
-    "tiene lugar",
-    "puedo ir",
-  ].some((k) => t.includes(k));
 }
 
 function detectPriceQuestion(text) {
   const t = text.toLowerCase();
   return [
     "precio",
+    "costo",
     "cuanto cuesta",
     "cuánto cuesta",
-    "costo",
     "cuanto sale",
     "cuánto sale",
+    "precio consulta",
+    "costo consulta",
+  ].some((k) => t.includes(k));
+}
+
+function detectAppointmentIntent(text) {
+  const t = text.toLowerCase();
+  return [
+    "quiero agendar",
+    "quiero cita",
+    "agendar cita",
+    "quiero una cita",
+    "hacer cita",
+    "sacar cita",
+    "quiero consulta",
+    "me quiero atender",
+    "tiene horario",
+    "tiene disponibilidad",
+    "quiero apartar",
   ].some((k) => t.includes(k));
 }
 
@@ -243,9 +204,7 @@ function extractPatientData(state, text, fromPhone) {
   }
 
   if (!state.patient.fechaNacimiento) {
-    const dobMatch = raw.match(
-      /\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/
-    );
+    const dobMatch = raw.match(/\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/);
     if (dobMatch) {
       state.patient.fechaNacimiento = dobMatch[1];
     }
@@ -263,20 +222,28 @@ function extractPatientData(state, text, fromPhone) {
   if (!state.patient.motivo) {
     const lower = raw.toLowerCase();
     if (
-      lower.includes("embarazo") ||
       lower.includes("revisión") ||
       lower.includes("revision") ||
-      lower.includes("ultrasonido") ||
+      lower.includes("embarazo") ||
       lower.includes("dolor") ||
       lower.includes("sangrado") ||
+      lower.includes("ultrasonido") ||
       lower.includes("infección") ||
       lower.includes("infeccion") ||
+      lower.includes("colpos") ||
       lower.includes("planificación") ||
       lower.includes("planificacion") ||
-      lower.includes("colposcop")
+      lower.includes("consulta")
     ) {
       state.patient.motivo = raw;
     }
+  }
+
+  const horarioMatch = raw.match(
+    /\b(lunes|miércoles|miercoles|viernes).*(3:30|4:00|4:30|5:00|5:30|6:00|6:30|7:00|7:30|8:00|8:30|9:00)\s*(pm)?\b/i
+  );
+  if (horarioMatch) {
+    state.patient.horarioElegido = raw;
   }
 }
 
@@ -289,14 +256,93 @@ function missingPatientFields(state) {
   return missing;
 }
 
-function buildSmartSlotOptions() {
-  // Base fija por ahora. Luego lo conectamos a Google Calendar.
-  // La idea es que aquí después metas disponibilidad real y lógica de optimización.
+function getPrimarySlots() {
   return ["miércoles 4:00 pm", "miércoles 4:30 pm"];
 }
 
-function buildSecondarySlotOptions() {
+function getSecondarySlots() {
   return ["viernes 5:00 pm", "viernes 5:30 pm"];
+}
+
+function buildWelcome() {
+  return `👩🏻‍⚕️ ¡Hola! Soy el asistente del Dr. Ricardo Cid Trejo, ginecólogo.
+
+Gracias por escribirnos.
+¿Me podrías compartir tu nombre y en qué te gustaría que te apoyáramos? 🩺✨`;
+}
+
+function buildPriorityReply() {
+  return `Por lo que me comentas es importante que el doctor lo valore directamente 🙏
+
+En un momento te apoyamos para darte atención prioritaria.
+
+Si gustas, puedes decirme brevemente qué está pasando mientras te canalizamos.`;
+}
+
+function buildPriceQualificationReply() {
+  return `Hola 😊 con gusto te ayudo
+
+¿Es para revisión general, embarazo o traes alguna molestia en particular?`;
+}
+
+function buildPriceReplyWithClose() {
+  const [a, b] = getPrimarySlots();
+  return `La consulta incluye valoración completa y ultrasonido 😊
+
+El costo es de ${CONSULTA_PRECIO}.
+
+Tengo disponible ${a} o ${b}, ¿cuál te queda mejor?`;
+}
+
+function buildAskForAppointmentData(state) {
+  const missing = missingPatientFields(state);
+
+  if (missing.length === 0) {
+    state.stage = "esperando_horario";
+    const [a, b] = getPrimarySlots();
+    return `Perfecto 😊
+
+Tengo disponible ${a} o ${b}, ¿cuál te queda mejor?`;
+  }
+
+  state.stage = "esperando_datos_cita";
+  return `Con gusto 😊
+
+Para dejarte agendada solo necesito ${missing.join(", ")}.
+
+Me los puedes mandar en un solo mensaje por favor.`;
+}
+
+function buildReminderMissingData(state) {
+  const missing = missingPatientFields(state);
+  return `Con gusto 😊
+
+Para continuar con tu cita solo me faltan ${missing.join(", ")}.
+
+Me los puedes mandar en un solo mensaje por favor.`;
+}
+
+function buildAlternativeSlots() {
+  const [a, b] = getSecondarySlots();
+  return `Claro 😊
+
+También te puedo ofrecer ${a} o ${b}.
+
+Si no te acomoda, dime si prefieres lunes, miércoles o viernes, y si te queda mejor más temprano o más tarde.`;
+}
+
+function buildConfirmation(state) {
+  state.stage = "confirmada";
+  return `Listo 😊
+
+Te dejo registrada con estos datos:
+Nombre: ${state.patient.nombre}
+Fecha de nacimiento: ${state.patient.fechaNacimiento}
+Teléfono: ${state.patient.telefono}
+Motivo: ${state.patient.motivo}
+Horario: ${state.patient.horarioElegido}
+
+En el siguiente paso la vamos a dejar confirmada en agenda.`;
 }
 
 async function askOpenAI(state, message) {
@@ -313,7 +359,7 @@ async function askOpenAI(state, message) {
       ...state.messages,
     ],
     temperature: 0.7,
-    max_tokens: 300,
+    max_tokens: 260,
   };
 
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -351,97 +397,174 @@ async function askOpenAI(state, message) {
   return reply;
 }
 
-function buildPriorityReply() {
-  return `Por lo que me comentas es importante que el doctor lo valore directamente 🙏
-
-En un momento te apoyamos para darte atención prioritaria.
-
-Si gustas, cuéntame brevemente cómo te sientes para orientarte mejor mientras te canalizamos.`;
+function shouldEscalateDoctor(text) {
+  const t = text.toLowerCase();
+  return (
+    t.includes("doctor") ||
+    t.includes("línea directa") ||
+    t.includes("linea directa") ||
+    t.includes("parto") ||
+    t.includes("cesarea") ||
+    t.includes("cesárea") ||
+    t.includes("urgencia") ||
+    t.includes("urgente")
+  );
 }
 
-function buildAppointmentDataRequest(state) {
-  const missing = missingPatientFields(state);
-
-  if (missing.length === 0) {
-    const [a, b] = buildSmartSlotOptions();
-    return `Perfecto 😊
-
-Tengo disponible ${a} o ${b}, ¿cuál te queda mejor?`;
-  }
-
-  return `Con gusto 😊
-
-Para dejarte agendada solo necesito ${missing.join(", ")}.
-
-Me los puedes mandar en un solo mensaje por favor.`;
-}
-
-function maybeHandleRuleBased(state, incomingMsg) {
-  const text = incomingMsg.toLowerCase();
+function routeByStage(state, incomingMsg, fromPhone) {
+  extractPatientData(state, incomingMsg, fromPhone);
 
   if (detectPriority(incomingMsg)) {
+    state.stage = "prioridad";
     state.flags.prioridad = true;
     return {
-      handled: true,
       reply: buildPriorityReply(),
-      notify: true,
-      notifyType: "PRIORIDAD",
+      notifyDoctor: true,
+      handled: true,
     };
   }
 
-  if (detectWantsAppointment(incomingMsg)) {
-    state.flags.quiereCita = true;
+  if (state.stage === "prioridad") {
     return {
+      reply: `Gracias por la información 🙏
+
+Ya quedó marcado como prioridad para que el doctor lo revise directamente.`,
+      notifyDoctor: true,
       handled: true,
-      reply: buildAppointmentDataRequest(state),
-      notify: false,
+    };
+  }
+
+  if (state.stage === "esperando_datos_cita") {
+    const missing = missingPatientFields(state);
+
+    if (missing.length === 0) {
+      state.stage = "esperando_horario";
+      const [a, b] = getPrimarySlots();
+      return {
+        reply: `Perfecto 😊
+
+Ya tengo tus datos.
+
+Tengo disponible ${a} o ${b}, ¿cuál te queda mejor?`,
+        handled: true,
+      };
+    }
+
+    if (isGreeting(incomingMsg)) {
+      return {
+        reply: buildReminderMissingData(state),
+        handled: true,
+      };
+    }
+
+    return {
+      reply: buildReminderMissingData(state),
+      handled: true,
+    };
+  }
+
+  if (state.stage === "esperando_horario") {
+    const text = incomingMsg.toLowerCase();
+
+    if (
+      text.includes("no puedo") ||
+      text.includes("otro horario") ||
+      text.includes("otra hora") ||
+      text.includes("no me queda")
+    ) {
+      return {
+        reply: buildAlternativeSlots(),
+        handled: true,
+      };
+    }
+
+    if (
+      text.includes("miércoles") ||
+      text.includes("miercoles") ||
+      text.includes("viernes") ||
+      text.includes("lunes") ||
+      text.includes("4:00") ||
+      text.includes("4:30") ||
+      text.includes("5:00") ||
+      text.includes("5:30") ||
+      text.includes("6:00") ||
+      text.includes("6:30") ||
+      text.includes("7:00") ||
+      text.includes("7:30") ||
+      text.includes("8:00") ||
+      text.includes("8:30") ||
+      text.includes("9:00")
+    ) {
+      state.patient.horarioElegido = incomingMsg.trim();
+      return {
+        reply: buildConfirmation(state),
+        handled: true,
+      };
+    }
+
+    if (isGreeting(incomingMsg)) {
+      const [a, b] = getPrimarySlots();
+      return {
+        reply: `Con gusto 😊
+
+Solo me falta que elijas horario.
+Tengo ${a} o ${b}, ¿cuál te queda mejor?`,
+        handled: true,
+      };
+    }
+
+    const [a, b] = getPrimarySlots();
+    return {
+      reply: `Con gusto 😊
+
+Para continuar solo necesito que me confirmes horario.
+Tengo ${a} o ${b}, ¿cuál te queda mejor?`,
+      handled: true,
+    };
+  }
+
+  if (state.stage === "confirmada") {
+    return {
+      reply: `Tu información ya quedó registrada 😊
+
+Si quieres, en el siguiente paso te confirmamos la cita final.`,
+      handled: true,
+    };
+  }
+
+  if (detectAppointmentIntent(incomingMsg)) {
+    return {
+      reply: buildAskForAppointmentData(state),
+      handled: true,
     };
   }
 
   if (detectPriceQuestion(incomingMsg) && !state.flags.yaDimosPrecio) {
-    state.flags.pidioPrecio = true;
-    return {
-      handled: true,
-      reply: `Hola 😊 con gusto te ayudo
-
-Cuéntame, ¿es para revisión general, embarazo o traes alguna molestia en particular?`,
-      notify: false,
-    };
+    if (!state.flags.pidioPrecio) {
+      state.flags.pidioPrecio = true;
+      state.stage = "precio_calificando";
+      return {
+        reply: buildPriceQualificationReply(),
+        handled: true,
+      };
+    }
   }
 
-  if (
-    state.flags.pidioPrecio &&
-    !state.flags.yaDimosPrecio &&
-    incomingMsg.trim().length > 6
-  ) {
+  if (state.stage === "precio_calificando") {
+    if (isGreeting(incomingMsg)) {
+      return {
+        reply: `Con gusto 😊
+
+Para orientarte mejor, ¿es para revisión general, embarazo o traes alguna molestia en particular?`,
+        handled: true,
+      };
+    }
+
     state.flags.yaDimosPrecio = true;
-    const [a, b] = buildSmartSlotOptions();
+    state.stage = "idle";
     return {
+      reply: buildPriceReplyWithClose(),
       handled: true,
-      reply: `La consulta incluye valoración completa y ultrasonido 😊
-
-El costo es de ${CONSULTA_PRECIO}.
-
-Tengo disponible ${a} o ${b}, ¿cuál te queda mejor?`,
-      notify: false,
-    };
-  }
-
-  if (
-    text.includes("no puedo") ||
-    text.includes("no me queda") ||
-    text.includes("otro horario") ||
-    text.includes("otra hora")
-  ) {
-    const [a, b] = buildSecondarySlotOptions();
-    return {
-      handled: true,
-      reply: `Claro 😊
-
-También te puedo ofrecer ${a} o ${b}.
-
-Si no te acomoda, dime si prefieres lunes, miércoles o viernes, y si te queda mejor más temprano o más tarde.`,
-      notify: false,
     };
   }
 
@@ -471,9 +594,7 @@ const server = createServer(async (req, res) => {
       console.log("Body:", incomingMsg);
 
       if (!incomingMsg) {
-        const xml = twiml(
-          "👩🏻‍⚕️ ¡Hola! Soy el asistente del Dr. Ricardo Cid Trejo, ginecólogo.\nGracias por escribirnos. ¿Me podrías compartir tu nombre y en qué te gustaría que te apoyáramos? 🩺✨"
-        );
+        const xml = twiml(buildWelcome());
         res.writeHead(200, {
           "Content-Type": "text/xml; charset=utf-8",
           "Content-Length": Buffer.byteLength(xml),
@@ -483,18 +604,15 @@ const server = createServer(async (req, res) => {
       }
 
       const state = getConversation(fromPhone);
-      extractPatientData(state, incomingMsg, fromPhone);
-
-      const ruleBased = maybeHandleRuleBased(state, incomingMsg);
 
       let reply = "";
-      let notify = false;
-      let notifyType = "";
+      let notifyDoctor = false;
 
-      if (ruleBased.handled) {
-        reply = ruleBased.reply;
-        notify = ruleBased.notify;
-        notifyType = ruleBased.notifyType;
+      const stageResult = routeByStage(state, incomingMsg, fromPhone);
+
+      if (stageResult.handled) {
+        reply = stageResult.reply;
+        notifyDoctor = !!stageResult.notifyDoctor;
       } else {
         if (!OPENAI_API_KEY) {
           reply =
@@ -504,17 +622,17 @@ const server = createServer(async (req, res) => {
             reply = await askOpenAI(state, incomingMsg);
           } catch (error) {
             console.error("Error OpenAI:", error);
-            reply =
-              "Hola 😊 Con gusto te ayudo a agendar tu cita. ¿Buscas revisión ginecológica o control de embarazo?";
+            reply = "Hola 😊 Con gusto te ayudo. ¿Buscas revisión ginecológica, control de embarazo o agendar una cita?";
           }
         }
       }
 
-      if (notify) {
-        console.log("🚨 NOTIFICAR AL DOCTOR:", notifyType, {
+      if (shouldEscalateDoctor(incomingMsg) || notifyDoctor) {
+        console.log("🚨 NOTIFICAR AL DOCTOR:", {
           telefono: fromPhone,
           mensaje: incomingMsg,
           paciente: state.patient,
+          stage: state.stage,
         });
       }
 
@@ -529,6 +647,7 @@ const server = createServer(async (req, res) => {
 
       const xml = twiml(reply);
 
+      console.log("STAGE ACTUAL:", state.stage);
       console.log("XML RESPUESTA:");
       console.log(xml);
 
