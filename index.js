@@ -28,10 +28,11 @@ const conversaciones = new Map();
 let huliJwt = null;
 let huliJwtExpiry = 0;
 
-// Configuración operativa del consultorio
-const ALLOWED_WEEKDAYS = new Set([1, 3, 5]); // lunes, miércoles, viernes
-const MIN_SLOT_MINUTES = 15 * 60 + 30; // 3:30 PM
-const MAX_SLOT_MINUTES = 21 * 60; // 9:00 PM inicio máximo
+// lunes, miércoles, viernes
+const ALLOWED_WEEKDAYS = new Set([1, 3, 5]);
+// 3:30 PM a 9:00 PM como hora máxima de inicio
+const MIN_SLOT_MINUTES = 15 * 60 + 30;
+const MAX_SLOT_MINUTES = 21 * 60;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // HELPERS GENERALES
@@ -70,28 +71,6 @@ function normalizeText(text) {
     .replace(/\p{Diacritic}/gu, "");
 }
 
-function isGreeting(text) {
-  const t = normalizeText(text);
-  return [
-    "hola",
-    "buenas",
-    "buenas tardes",
-    "buenos dias",
-    "buen dia",
-    "buenas noches",
-    "ok",
-    "oki",
-    "gracias",
-    "sale",
-    "va",
-    "si",
-    "sí",
-    "👍",
-    "🙂",
-    "😊",
-  ].includes(t);
-}
-
 function safeJsonParse(text) {
   if (!text) return null;
 
@@ -109,10 +88,44 @@ function safeJsonParse(text) {
   }
 }
 
+function isGreeting(text) {
+  const t = normalizeText(text);
+  return [
+    "hola",
+    "buenas",
+    "buenas tardes",
+    "buen dia",
+    "buenos dias",
+    "buenas noches",
+    "ok",
+    "oki",
+    "gracias",
+    "sale",
+    "va",
+    "si",
+    "sí",
+    "👍",
+    "🙂",
+    "😊",
+  ].includes(t);
+}
+
+function buildWelcomeMessage() {
+  return `👩🏻‍⚕️ Hola. Soy el asistente del Dr. Ricardo Cid Trejo, ginecólogo.
+
+Gracias por escribirnos. ¿Me podrías compartir tu nombre y en qué te gustaría que te apoyáramos? 🩺✨`;
+}
+
+function buildInfoOpeningReply() {
+  return `Claro 😊 Soy el asistente del Dr. Ricardo Cid Trejo.
+
+Cuéntame qué está pasando o qué síntomas tienes, y con gusto te apoyo con una orientación inicial.`;
+}
+
 function getConv(phone) {
   if (!conversaciones.has(phone)) {
     conversaciones.set(phone, {
-      stage: "idle", // idle | precio_q | motivo | horario | datos | datos_manual | espera_confirmacion | confirmada | prioridad
+      stage: "idle", // idle | duda | precio_q | motivo | horario | datos | datos_manual | espera_confirmacion | confirmada | prioridad
       messages: [],
       patient: {
         nombre: "",
@@ -151,14 +164,10 @@ async function huliGetToken() {
   const raw = await res.text();
   if (!res.ok) throw new Error(`Huli auth failed: ${raw}`);
 
-  let data;
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    throw new Error(`Huli auth no devolvió JSON: ${raw}`);
-  }
+  const data = safeJsonParse(raw);
+  if (!data?.data?.jwt) throw new Error(`Huli auth inválido: ${raw}`);
 
-  huliJwt = data?.data?.jwt || "";
+  huliJwt = data.data.jwt;
   huliJwtExpiry = Date.now() + 50 * 60 * 1000;
   return huliJwt;
 }
@@ -175,9 +184,7 @@ async function huliRequest(method, path, body = null) {
     },
   };
 
-  if (body) {
-    opts.body = JSON.stringify(body);
-  }
+  if (body) opts.body = JSON.stringify(body);
 
   const res = await fetch(`${HULI_BASE}${path}`, opts);
   const raw = await res.text();
@@ -186,11 +193,10 @@ async function huliRequest(method, path, body = null) {
     throw new Error(`Huli ${method} ${path} -> ${res.status}: ${raw}`);
   }
 
-  try {
-    return JSON.parse(raw);
-  } catch {
-    throw new Error(`Huli ${method} ${path} no devolvió JSON: ${raw}`);
-  }
+  const data = safeJsonParse(raw);
+  if (!data) throw new Error(`Huli ${method} ${path} no devolvió JSON: ${raw}`);
+
+  return data;
 }
 
 function isAllowedSlot(slot) {
@@ -202,9 +208,11 @@ function isAllowedSlot(slot) {
   const weekday = dt.getDay();
   const minutes = dt.getHours() * 60 + dt.getMinutes();
 
-  return ALLOWED_WEEKDAYS.has(weekday) &&
+  return (
+    ALLOWED_WEEKDAYS.has(weekday) &&
     minutes >= MIN_SLOT_MINUTES &&
-    minutes <= MAX_SLOT_MINUTES;
+    minutes <= MAX_SLOT_MINUTES
+  );
 }
 
 async function huliGetSlots(rangeDays = 7) {
@@ -303,36 +311,53 @@ async function huliCreateAppointment(slot, patientFileId, motivo) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// PROMPT / OPENAI
+// OPENAI
 // ══════════════════════════════════════════════════════════════════════════════
 
 const SYSTEM_PROMPT = `
 Eres el asistente virtual de WhatsApp del ${CONSULTORIO_NOMBRE}.
-Atiendes con calidez y llevas a las pacientes a agendar cita.
+
+OBJETIVO:
+- Ayudar por WhatsApp
+- Resolver dudas iniciales con calma
+- Llevar a la paciente a agendar consulta cuando convenga
+- Escalar si es urgente o si quiere hablar directamente con el doctor
 
 ESTILO:
-- Saluda con naturalidad
-- Respuestas cortas, claras y humanas
+- Español natural
+- Cálido
+- Profesional
+- Humano
+- Respuestas claras, no demasiado largas
 - Emojis moderados: 😊 🙂 👍🏻
-- Transmite tranquilidad
-- Siempre busca avanzar a una acción concreta
 
 REGLAS:
-- NO diagnostiques
-- NO recetes medicamentos
-- NO digas que eres IA
-- El precio (${CONSULTA_PRECIO}, incluye ultrasonido) solo se menciona cuando ya hay contexto o interés real
-- Preséntate como asistente del doctor
-- No asumas embarazo solo por mencionar ultrasonido
+- Siempre habla como asistente del doctor
+- No digas que eres IA
+- No des diagnósticos definitivos
+- No recetes medicamentos
+- No cambies tratamientos
+- No prometas resultados
+- No alarmes innecesariamente
+
+SI LA PACIENTE TIENE UNA DUDA O CUENTA SÍNTOMAS:
+- primero responde con calma y de forma tranquilizadora
+- da orientación general, sin diagnosticar ni recetar
+- evita alarmar innecesariamente
+- después explica que para mayor claridad lo ideal es valorarlo en consulta
+- termina diciendo que si siente que es algo urgente o si quiere hablar directamente con el doctor, lo diga y se le notifica
 
 URGENCIAS:
-- Sangrado abundante
-- Dolor intenso
-- Fiebre en embarazo
-- Posible ectópico
-- Parto
-- Cesárea
-=> responder con prioridad y calma, y canalizar con el doctor
+- sangrado abundante
+- dolor intenso
+- fiebre en embarazo
+- posible ectópico
+- parto
+- cesárea
+=> responder con prioridad y calma, e indicar que se canalizará con el doctor
+
+PRECIO:
+- El precio (${CONSULTA_PRECIO}, incluye ultrasonido) solo se menciona cuando hay contexto o cuando lo preguntan directamente
 
 CONSULTORIO:
 - Hospital MediPab, Aquiles Serdán 17, Pabellón de Arteaga, Ags.
@@ -358,11 +383,9 @@ async function callOAI(messages, temp = 0.2, tokens = 300) {
   });
 
   const raw = await res.text();
+  const data = safeJsonParse(raw);
 
-  let data;
-  try {
-    data = JSON.parse(raw);
-  } catch {
+  if (!data) {
     throw new Error(`OpenAI no devolvió JSON: ${raw}`);
   }
 
@@ -384,13 +407,17 @@ Devuelve SOLO JSON válido:
   "patient_reason": "",
   "wants_appointment": false,
   "wants_price": false,
+  "wants_info": false,
   "is_priority": false,
+  "wants_doctor_direct": false,
   "slot_choice": "",
   "cant_make_it": false,
   "preferred_schedule": ""
 }
 
 Reglas:
+- wants_info = true si expresa duda, pregunta, quiere orientación o cuenta síntomas
+- wants_doctor_direct = true si pide hablar directamente con el doctor
 - slot_choice: "1" o "2" si elige horario, o texto breve si menciona uno
 - patient_dob: DD/MM/YYYY si se detecta
 - preferred_schedule: si menciona preferencia como "viernes", "más tarde", "después de las 6", "miércoles"
@@ -411,7 +438,7 @@ Reglas:
         },
       ],
       0.1,
-      220
+      240
     );
 
     return safeJsonParse(txt);
@@ -429,7 +456,7 @@ async function writerReply(state, msg) {
   const reply = await callOAI(
     [{ role: "system", content: SYSTEM_PROMPT }, ...state.messages],
     0.7,
-    350
+    420
   );
 
   state.messages.push({ role: "assistant", content: reply });
@@ -437,11 +464,11 @@ async function writerReply(state, msg) {
     state.messages.splice(0, state.messages.length - 16);
   }
 
-  return reply || "Hola 😊 ¿En qué te puedo ayudar?";
+  return reply || "Claro 😊 Soy el asistente del Dr. Ricardo Cid Trejo. Cuéntame cómo te puedo apoyar.";
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// DETECCIÓN / EXTRACCIÓN
+// DETECTORES
 // ══════════════════════════════════════════════════════════════════════════════
 
 function isPriority(text) {
@@ -484,6 +511,7 @@ function wantsAppointment(text) {
     "quisiera agendar",
     "tiene horarios",
     "que horarios tiene",
+    "para agendar una cita",
   ].some((k) => t.includes(k));
 }
 
@@ -495,6 +523,45 @@ function wantsPrice(text) {
     "costo",
     "cuanto sale",
     "cuanto cobra",
+  ].some((k) => t.includes(k));
+}
+
+function wantsInfo(text) {
+  const t = normalizeText(text);
+  return [
+    "tengo una duda",
+    "una duda",
+    "quiero informacion",
+    "quisiera informacion",
+    "quiero preguntar",
+    "tengo una pregunta",
+    "una pregunta",
+    "informes",
+    "informacion",
+    "me puede orientar",
+    "me puedes orientar",
+    "tengo sintomas",
+    "tengo síntomas",
+    "tengo molestia",
+    "tengo molestias",
+    "me pasa algo",
+    "quiero saber",
+    "tengo flujo",
+    "tengo dolor",
+    "tengo sangrado",
+  ].some((k) => t.includes(normalizeText(k)));
+}
+
+function wantsDoctorDirect(text) {
+  const t = normalizeText(text);
+  return [
+    "hablar con el doctor",
+    "hablar directamente con el doctor",
+    "quiero hablar con el doctor",
+    "quiero hablar directamente con el doctor",
+    "comunicarme con el doctor",
+    "quiero hablar con ricardo",
+    "quiero hablar con el dr",
   ].some((k) => t.includes(k));
 }
 
@@ -512,6 +579,10 @@ function cantMakeIt(text) {
     "mas temprano",
   ].some((k) => t.includes(k));
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// DATOS DE PACIENTE
+// ══════════════════════════════════════════════════════════════════════════════
 
 function nextMissingField(state) {
   if (!state.patient.nombre) return "nombre";
@@ -536,6 +607,43 @@ function buildNextDataQuestion(state) {
   }
 
   return null;
+}
+
+function looksLikeRealName(text) {
+  const clean = String(text || "").trim();
+  const normalized = normalizeText(clean);
+
+  if (!clean || clean.includes("?")) return false;
+  if (clean.length < 5 || clean.length > 60) return false;
+
+  const blockedWords = [
+    "precio",
+    "cuesta",
+    "costo",
+    "cita",
+    "consulta",
+    "duda",
+    "horario",
+    "doctor",
+    "ultrasonido",
+    "embarazo",
+    "dolor",
+    "sangrado",
+    "quiero",
+    "tengo",
+    "para",
+    "pero",
+    "motivo",
+    "informacion",
+    "pregunta",
+  ];
+
+  if (blockedWords.some((word) => normalized.includes(word))) return false;
+
+  const words = clean.split(/\s+/).filter(Boolean);
+  if (words.length < 2 || words.length > 4) return false;
+
+  return words.every((w) => /^[A-Za-zÀ-ÿÑñ]+$/.test(w) && w.length >= 2);
 }
 
 function updateManualPreference(state, msg, cls = null) {
@@ -568,7 +676,9 @@ function updateManualPreference(state, msg, cls = null) {
   ];
 
   const normalized = normalizeText(text);
-  const looksLikePreference = hints.some((h) => normalized.includes(normalizeText(h)));
+  const looksLikePreference = hints.some((h) =>
+    normalized.includes(normalizeText(h))
+  );
 
   if (cls?.preferred_schedule && cls.preferred_schedule.trim()) {
     state.manualPreference = cls.preferred_schedule.trim();
@@ -604,14 +714,10 @@ function extractData(state, text, fromPhone) {
     !state.patient.nombre &&
     (state.stage === "datos" || state.stage === "datos_manual") &&
     nextMissingField(state) === "nombre" &&
-    !isGreeting(clean)
+    !isGreeting(clean) &&
+    looksLikeRealName(clean)
   ) {
-    const soloNombre = clean.match(
-      /^[A-Za-zÀ-ÿÑñ]+(?:\s+[A-Za-zÀ-ÿÑñ]+){1,4}$/
-    );
-    if (soloNombre) {
-      state.patient.nombre = clean;
-    }
+    state.patient.nombre = clean;
   }
 
   const motivoKw = [
@@ -638,6 +744,7 @@ function extractData(state, text, fromPhone) {
     "flujo",
     "comezon",
     "comezón",
+    "ardor",
   ];
 
   if (!state.patient.motivo && motivoKw.some((k) => normalized.includes(normalizeText(k)))) {
@@ -730,7 +837,68 @@ Ya le avisamos que la contactarán para confirmar su horario.`,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// FORMATEO / SLOTS
+// DUDAS / ORIENTACIÓN
+// ══════════════════════════════════════════════════════════════════════════════
+
+async function answerMedicalDoubt(state, msg) {
+  if (!OPENAI_API_KEY) {
+    return `Gracias por explicarme 😊
+
+Por lo que comentas, no siempre significa algo grave, pero para poder orientarte con mayor claridad lo ideal es valorarlo en consulta.
+
+Si sientes que es algo urgente o si prefieres hablar directamente con el doctor, dime y se lo notifico.`;
+  }
+
+  const prompt = `Eres el asistente virtual del ${CONSULTORIO_NOMBRE}.
+
+La paciente está contando una duda o síntomas.
+Responde en español, con tono cálido y tranquilizador.
+
+Objetivo:
+- dar orientación general, sin diagnosticar
+- no recetar ni indicar tratamientos
+- no alarmar innecesariamente
+- no minimizar algo potencialmente importante
+- invitar a consulta para aclarar mejor
+- terminar diciendo que si es urgente o si quiere hablar directamente con el doctor, lo diga y se le notifica
+
+Hazlo en formato de WhatsApp, natural, humano y breve.`;
+
+  try {
+    const reply = await callOAI(
+      [
+        { role: "system", content: prompt },
+        {
+          role: "user",
+          content: JSON.stringify({
+            patient_context: state.patient,
+            message: msg,
+          }),
+        },
+      ],
+      0.5,
+      260
+    );
+
+    return (
+      reply ||
+      `Gracias por explicarme 😊
+
+Por lo que comentas, no siempre significa algo grave, pero para poder orientarte con mayor claridad lo ideal es valorarlo en consulta.
+
+Si sientes que es algo urgente o si prefieres hablar directamente con el doctor, dime y se lo notifico.`
+    );
+  } catch {
+    return `Gracias por explicarme 😊
+
+Por lo que comentas, no siempre significa algo grave, pero para poder orientarte con mayor claridad lo ideal es valorarlo en consulta.
+
+Si sientes que es algo urgente o si prefieres hablar directamente con el doctor, dime y se lo notifico.`;
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SLOTS / FLUJO HULI
 // ══════════════════════════════════════════════════════════════════════════════
 
 function formatSlots(slots) {
@@ -790,16 +958,15 @@ function detectSlotChoice(msg, cls, slots) {
   return null;
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// FLUJO MANUAL / FLUJO HULI
-// ══════════════════════════════════════════════════════════════════════════════
-
 async function pedirDatosYEsperarManual(state) {
   const question = buildNextDataQuestion(state);
 
   if (question) {
     state.stage = "datos_manual";
-    return `Con mucho gusto 😊\n\nPara poder agendarte necesito algunos datos.\n${question}`;
+    return `Con mucho gusto 😊
+
+Para poder agendarte necesito algunos datos.
+${question}`;
   }
 
   return await confirmarEsperaManual(state);
@@ -822,14 +989,17 @@ Cualquier duda, aquí me quedo al pendiente 🙂`;
 
 async function ofrecerHorarios(state) {
   if (!huliDisponible()) {
+    console.log("Huli no configurado completo, entrando a modo manual");
     state.stage = "datos_manual";
     return await pedirDatosYEsperarManual(state);
   }
 
   try {
     const slots = await huliGetSlots(7);
+    console.log("Slots recibidos de Huli:", slots.length);
 
     if (!slots.length) {
+      console.log("Huli activo pero sin slots válidos, entrando a modo manual");
       state.stage = "datos_manual";
       return await pedirDatosYEsperarManual(state);
     }
@@ -951,7 +1121,7 @@ Cualquier duda, aquí me quedo al pendiente 🙂`;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// ROUTER
+// ROUTER PRINCIPAL
 // ══════════════════════════════════════════════════════════════════════════════
 
 async function route(state, msg, fromPhone, cls) {
@@ -974,7 +1144,7 @@ async function route(state, msg, fromPhone, cls) {
     updateManualPreference(state, cls.preferred_schedule, cls);
   }
 
-  if (isPriority(msg) || cls?.is_priority) {
+  if (isPriority(msg) || cls?.is_priority || wantsDoctorDirect(msg) || cls?.wants_doctor_direct) {
     state.stage = "prioridad";
     notifyDoctor("URGENCIA", state, msg).catch(console.error);
 
@@ -984,10 +1154,60 @@ En un momento te apoyamos para darte atención prioritaria.
 Si puedes, cuéntame brevemente cómo te sientes.`;
   }
 
+  if (state.stage === "idle" && isGreeting(msg)) {
+    return buildWelcomeMessage();
+  }
+
+  if (state.stage === "idle" && (wantsInfo(msg) || cls?.wants_info)) {
+    state.stage = "duda";
+    return buildInfoOpeningReply();
+  }
+
+  if (state.stage === "duda") {
+    if (wantsAppointment(msg) || cls?.wants_appointment) {
+      if (!state.patient.motivo) {
+        state.stage = "motivo";
+        return `Claro, con gusto te ayudo a agendar 😊
+
+¿Me puedes decir brevemente el motivo de la consulta?`;
+      }
+
+      state.stage = "horario";
+      return await ofrecerHorarios(state);
+    }
+
+    if (wantsPrice(msg) || cls?.wants_price) {
+      state.flags.yaDimosPrecio = true;
+      return `Claro 😊 La consulta incluye valoración completa y ultrasonido.
+
+El costo es ${CONSULTA_PRECIO}.
+
+Si gustas, también te puedo ayudar a agendar tu cita.`;
+    }
+
+    if (isGreeting(msg)) {
+      return "Claro 😊 Cuéntame tu duda o qué síntomas tienes, y con gusto te apoyo.";
+    }
+
+    return await answerMedicalDoubt(state, msg);
+  }
+
   if (state.stage === "espera_confirmacion") {
     return `Ya tenemos tus datos y el consultorio te contactará pronto para confirmar tu horario 😊
 
 Cualquier duda, aquí me quedo al pendiente.`;
+  }
+
+  if (
+    (state.stage === "datos" || state.stage === "datos_manual") &&
+    (wantsPrice(msg) || cls?.wants_price)
+  ) {
+    state.flags.yaDimosPrecio = true;
+    return `Claro 😊 La consulta incluye valoración completa y ultrasonido.
+
+El costo es ${CONSULTA_PRECIO}.
+
+${buildNextDataQuestion(state) || "Si gustas, continúo con tu registro."}`;
   }
 
   if (state.stage === "datos_manual") {
@@ -1092,13 +1312,13 @@ ${formatSlots(state.slots)}`;
   }
 
   if (!OPENAI_API_KEY) {
-    return "Hola 😊 ¿En qué te puedo ayudar?";
+    return "Claro 😊 Soy el asistente del Dr. Ricardo Cid Trejo. Cuéntame cómo te puedo apoyar.";
   }
 
   try {
     return await writerReply(state, msg);
   } catch {
-    return "Hola 😊 ¿Te gustaría agendar una cita o tienes alguna duda?";
+    return "Claro 😊 Soy el asistente del Dr. Ricardo Cid Trejo. Cuéntame cómo te puedo apoyar y con gusto te ayudo.";
   }
 }
 
@@ -1129,10 +1349,7 @@ const server = createServer(async (req, res) => {
       const state = getConv(fromPhone);
 
       if (!msg) {
-        const xml = twiml(
-          "👩🏻‍⚕️ Hola. Soy el asistente del Dr. Ricardo Cid Trejo, ginecólogo.\nGracias por escribirnos. ¿Me podrías compartir tu nombre y en qué te gustaría que te apoyáramos? 🩺✨"
-        );
-
+        const xml = twiml(buildWelcomeMessage());
         res.writeHead(200, {
           "Content-Type": "text/xml; charset=utf-8",
           "Content-Length": Buffer.byteLength(xml),
@@ -1151,7 +1368,7 @@ const server = createServer(async (req, res) => {
       console.log("CLS:", JSON.stringify(cls));
 
       const reply = await route(state, msg, fromPhone, cls);
-      console.log(`[Stage:${state.stage}] Reply:${reply.slice(0, 140)}`);
+      console.log(`[Stage:${state.stage}] Reply:${reply.slice(0, 160)}`);
 
       const xml = twiml(reply);
 
