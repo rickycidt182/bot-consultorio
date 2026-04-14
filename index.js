@@ -1416,7 +1416,23 @@ const server = createServer(async (req, res) => {
       res.end(xml);
       return;
     }
-
+if (req.method === "GET" && req.url === "/test-huli") {
+  try {
+    const token = await huliGetToken();
+    const from = new Date();
+    from.setHours(from.getHours() + 1, 0, 0, 0);
+    const to = new Date(from);
+    to.setDate(to.getDate() + 30);
+    const path = `/practice/v2/availability/doctor/${HULI_DOCTOR_ID}/clinic/${HULI_CLINIC_ID}?from=${from.toISOString()}&to=${to.toISOString()}`;
+    const data = await huliRequest("GET", path);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(data, null, 2));
+  } catch (e) {
+    res.writeHead(500, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: e.message }));
+  }
+  return;
+}
     res.writeHead(404, { "Content-Type": "text/plain;charset=utf-8" });
     res.end("Not found");
   } catch (err) {
