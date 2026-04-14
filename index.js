@@ -30,12 +30,12 @@ let huliJwtExpiry = 0;
 
 // lunes, miércoles, viernes
 const ALLOWED_WEEKDAYS = new Set([1, 3, 5]);
-// 3:30 PM a 9:00 PM como hora máxima de inicio
+// 3:30 PM a 9:00 PM como inicio máximo
 const MIN_SLOT_MINUTES = 15 * 60 + 30;
 const MAX_SLOT_MINUTES = 21 * 60;
 
 // ══════════════════════════════════════════════════════════════════════════════
-// HELPERS GENERALES
+// HELPERS
 // ══════════════════════════════════════════════════════════════════════════════
 
 function twiml(message) {
@@ -354,6 +354,7 @@ URGENCIAS:
 - posible ectópico
 - parto
 - cesárea
+- ausencia de movimientos fetales
 => responder con prioridad y calma, e indicar que se canalizará con el doctor
 
 PRECIO:
@@ -418,6 +419,7 @@ Devuelve SOLO JSON válido:
 Reglas:
 - wants_info = true si expresa duda, pregunta, quiere orientación o cuenta síntomas
 - wants_doctor_direct = true si pide hablar directamente con el doctor
+- is_priority = true si hay urgencia obstétrica o ausencia de movimientos fetales
 - slot_choice: "1" o "2" si elige horario, o texto breve si menciona uno
 - patient_dob: DD/MM/YYYY si se detecta
 - preferred_schedule: si menciona preferencia como "viernes", "más tarde", "después de las 6", "miércoles"
@@ -464,7 +466,10 @@ async function writerReply(state, msg) {
     state.messages.splice(0, state.messages.length - 16);
   }
 
-  return reply || "Claro 😊 Soy el asistente del Dr. Ricardo Cid Trejo. Cuéntame cómo te puedo apoyar.";
+  return (
+    reply ||
+    "Claro 😊 Soy el asistente del Dr. Ricardo Cid Trejo. Cuéntame cómo te puedo apoyar."
+  );
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -485,10 +490,16 @@ function isPriority(text) {
     "dolor insoportable",
     "fiebre",
     "embarazo ectopico",
-    "hablar con el doctor",
-    "linea directa",
     "emergencia",
     "no se mueve mi bebe",
+    "ya no se mueve mi bebe",
+    "no siento que se mueva mi bebe",
+    "dejo de moverse mi bebe",
+    "dejo de sentir a mi bebe",
+    "no siento movimientos",
+    "no siento a mi bebe",
+    "no lo siento moverse",
+    "mi bebe no se mueve",
   ].some((k) => t.includes(k));
 }
 
@@ -512,6 +523,10 @@ function wantsAppointment(text) {
     "tiene horarios",
     "que horarios tiene",
     "para agendar una cita",
+    "cuando tiene citas",
+    "cuando hay citas",
+    "que citas tiene",
+    "cuando tiene lugar",
   ].some((k) => t.includes(k));
 }
 
@@ -523,6 +538,7 @@ function wantsPrice(text) {
     "costo",
     "cuanto sale",
     "cuanto cobra",
+    "que precio tiene",
   ].some((k) => t.includes(k));
 }
 
@@ -549,6 +565,7 @@ function wantsInfo(text) {
     "tengo flujo",
     "tengo dolor",
     "tengo sangrado",
+    "duda de",
   ].some((k) => t.includes(normalizeText(k)));
 }
 
@@ -562,6 +579,13 @@ function wantsDoctorDirect(text) {
     "comunicarme con el doctor",
     "quiero hablar con ricardo",
     "quiero hablar con el dr",
+    "hablo con el dr",
+    "hablo con el doctor",
+    "es el dr cid",
+    "es usted el doctor",
+    "me puede pasar con el doctor",
+    "me comunicas con el doctor",
+    "hablo con el dr cid",
   ].some((k) => t.includes(k));
 }
 
@@ -581,7 +605,7 @@ function cantMakeIt(text) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// DATOS DE PACIENTE
+// DATOS PACIENTE
 // ══════════════════════════════════════════════════════════════════════════════
 
 function nextMissingField(state) {
@@ -747,7 +771,10 @@ function extractData(state, text, fromPhone) {
     "ardor",
   ];
 
-  if (!state.patient.motivo && motivoKw.some((k) => normalized.includes(normalizeText(k)))) {
+  if (
+    !state.patient.motivo &&
+    motivoKw.some((k) => normalized.includes(normalizeText(k)))
+  ) {
     state.patient.motivo = clean.slice(0, 200);
   }
 
@@ -762,7 +789,7 @@ function extractData(state, text, fromPhone) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// TWILIO / NOTIFICACIONES
+// TWILIO
 // ══════════════════════════════════════════════════════════════════════════════
 
 async function notifyDoctor(type, state, extra = "") {
@@ -898,7 +925,7 @@ Si sientes que es algo urgente o si prefieres hablar directamente con el doctor,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SLOTS / FLUJO HULI
+// HORARIOS / HULI
 // ══════════════════════════════════════════════════════════════════════════════
 
 function formatSlots(slots) {
@@ -1121,7 +1148,7 @@ Cualquier duda, aquí me quedo al pendiente 🙂`;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// ROUTER PRINCIPAL
+// ROUTER
 // ══════════════════════════════════════════════════════════════════════════════
 
 async function route(state, msg, fromPhone, cls) {
@@ -1144,7 +1171,13 @@ async function route(state, msg, fromPhone, cls) {
     updateManualPreference(state, cls.preferred_schedule, cls);
   }
 
-  if (isPriority(msg) || cls?.is_priority || wantsDoctorDirect(msg) || cls?.wants_doctor_direct) {
+  // URGENCIA O CONTACTO DIRECTO
+  if (
+    isPriority(msg) ||
+    cls?.is_priority ||
+    wantsDoctorDirect(msg) ||
+    cls?.wants_doctor_direct
+  ) {
     state.stage = "prioridad";
     notifyDoctor("URGENCIA", state, msg).catch(console.error);
 
@@ -1154,16 +1187,33 @@ En un momento te apoyamos para darte atención prioritaria.
 Si puedes, cuéntame brevemente cómo te sientes.`;
   }
 
+  // SALUDO INICIAL
   if (state.stage === "idle" && isGreeting(msg)) {
     return buildWelcomeMessage();
   }
 
+  // ENTRADA POR DUDA
   if (state.stage === "idle" && (wantsInfo(msg) || cls?.wants_info)) {
     state.stage = "duda";
     return buildInfoOpeningReply();
   }
 
+  // ETAPA DUDA
   if (state.stage === "duda") {
+    if (
+      isPriority(msg) ||
+      cls?.is_priority ||
+      wantsDoctorDirect(msg) ||
+      cls?.wants_doctor_direct
+    ) {
+      state.stage = "prioridad";
+      notifyDoctor("URGENCIA", state, msg).catch(console.error);
+      return `Por lo que me comentas es importante que el doctor lo valore directamente 🙏
+
+En un momento te apoyamos para darte atención prioritaria.
+Si quieres, te sigo leyendo mientras lo notificamos.`;
+    }
+
     if (wantsAppointment(msg) || cls?.wants_appointment) {
       if (!state.patient.motivo) {
         state.stage = "motivo";
@@ -1185,6 +1235,15 @@ El costo es ${CONSULTA_PRECIO}.
 Si gustas, también te puedo ayudar a agendar tu cita.`;
     }
 
+    if (
+      normalizeText(msg).includes("cuando tiene citas") ||
+      normalizeText(msg).includes("cuando tiene lugar") ||
+      normalizeText(msg).includes("que horarios tiene")
+    ) {
+      state.stage = "horario";
+      return await ofrecerHorarios(state);
+    }
+
     if (isGreeting(msg)) {
       return "Claro 😊 Cuéntame tu duda o qué síntomas tienes, y con gusto te apoyo.";
     }
@@ -1192,12 +1251,14 @@ Si gustas, también te puedo ayudar a agendar tu cita.`;
     return await answerMedicalDoubt(state, msg);
   }
 
+  // ESPERA MANUAL
   if (state.stage === "espera_confirmacion") {
     return `Ya tenemos tus datos y el consultorio te contactará pronto para confirmar tu horario 😊
 
 Cualquier duda, aquí me quedo al pendiente.`;
   }
 
+  // PRECIO DURANTE CAPTURA DE DATOS
   if (
     (state.stage === "datos" || state.stage === "datos_manual") &&
     (wantsPrice(msg) || cls?.wants_price)
@@ -1210,12 +1271,14 @@ El costo es ${CONSULTA_PRECIO}.
 ${buildNextDataQuestion(state) || "Si gustas, continúo con tu registro."}`;
   }
 
+  // MODO MANUAL
   if (state.stage === "datos_manual") {
     const q = buildNextDataQuestion(state);
     if (q) return q;
     return await confirmarEsperaManual(state);
   }
 
+  // PREGUNTA DE PRECIO SIN MOTIVO
   if (
     (wantsPrice(msg) || cls?.wants_price) &&
     !state.flags.pidioPrecio &&
@@ -1229,6 +1292,7 @@ ${buildNextDataQuestion(state) || "Si gustas, continúo con tu registro."}`;
 ¿Es para revisión general, embarazo o traes alguna molestia en particular?`;
   }
 
+  // PRECIO CON MOTIVO YA DETECTADO
   if (
     (wantsPrice(msg) || cls?.wants_price) &&
     !state.flags.yaDimosPrecio &&
@@ -1239,6 +1303,7 @@ ${buildNextDataQuestion(state) || "Si gustas, continúo con tu registro."}`;
     return await ofrecerPrecioYHorarios(state);
   }
 
+  // RESPUESTA A CALIFICACIÓN DE PRECIO
   if (state.stage === "precio_q" && msg.trim().length > 3 && !isGreeting(msg)) {
     if (!state.patient.motivo) {
       state.patient.motivo = msg.trim().slice(0, 200);
@@ -1248,6 +1313,7 @@ ${buildNextDataQuestion(state) || "Si gustas, continúo con tu registro."}`;
     return await ofrecerPrecioYHorarios(state);
   }
 
+  // INTENCIÓN DE CITA
   if (wantsAppointment(msg) || cls?.wants_appointment) {
     if (!state.patient.motivo) {
       state.stage = "motivo";
@@ -1260,6 +1326,7 @@ ${buildNextDataQuestion(state) || "Si gustas, continúo con tu registro."}`;
     return await ofrecerHorarios(state);
   }
 
+  // ETAPA MOTIVO
   if (state.stage === "motivo") {
     if (!isGreeting(msg) && msg.trim().length > 3) {
       if (!state.patient.motivo) {
@@ -1274,6 +1341,7 @@ ${buildNextDataQuestion(state) || "Si gustas, continúo con tu registro."}`;
 ¿Me puedes decir brevemente el motivo de la consulta?`;
   }
 
+  // ETAPA HORARIO
   if (state.stage === "horario") {
     if (cantMakeIt(msg) || cls?.cant_make_it) {
       return await ofrecerHorariosAlternativos(state, msg, cls);
@@ -1305,12 +1373,14 @@ ${formatSlots(state.slots)}`;
 ${formatSlots(state.slots)}`;
   }
 
+  // ETAPA DATOS
   if (state.stage === "datos") {
     const q = buildNextDataQuestion(state);
     if (q) return q;
     return await agendarCita(state);
   }
 
+  // FALLBACK
   if (!OPENAI_API_KEY) {
     return "Claro 😊 Soy el asistente del Dr. Ricardo Cid Trejo. Cuéntame cómo te puedo apoyar.";
   }
@@ -1323,7 +1393,7 @@ ${formatSlots(state.slots)}`;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SERVIDOR
+// SERVER
 // ══════════════════════════════════════════════════════════════════════════════
 
 const server = createServer(async (req, res) => {
@@ -1342,9 +1412,7 @@ const server = createServer(async (req, res) => {
       const msg = (params.get("Body") || "").trim();
       const fromPhone = params.get("From") || "desconocido";
 
-      console.log(
-        `[${new Date().toISOString()}] From:${fromPhone} Msg:${msg}`
-      );
+      console.log(`[${new Date().toISOString()}] From:${fromPhone} Msg:${msg}`);
 
       const state = getConv(fromPhone);
 
