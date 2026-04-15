@@ -1,6 +1,5 @@
 import { createServer } from "node:http";
 import { URLSearchParams } from "node:url";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
 
 const PORT = Number(process.env.PORT || 8080);
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
@@ -22,101 +21,20 @@ const HULI_DOCTOR_ID = process.env.HULI_DOCTOR_ID || "";
 const HULI_CLINIC_ID = process.env.HULI_CLINIC_ID || "";
 const HULI_BASE = "https://api.huli.io";
 
-// ── FIX #6: Horarios desde env vars con fallback a los valores originales ─────
-// Para cambiar horarios sin deploy, setea estas vars en Railway:
-//   ALLOWED_WEEKDAYS=1,3,5   (1=lunes, 3=miércoles, 5=viernes)
-//   SLOT_START_HHMM=15:30
-//   SLOT_END_HHMM=21:30
-const ALLOWED_WEEKDAYS = new Set(
-  (process.env.ALLOWED_WEEKDAYS || "1,3,5")
-    .split(",")
-    .map((n) => parseInt(n.trim(), 10))
-    .filter((n) => !isNaN(n))
-);
+const huliDisponible = () =>
+  !!(HULI_API_KEY && HULI_ORG_ID && HULI_DOCTOR_ID && HULI_CLINIC_ID);
 
-function hhmm_to_minutes(str) {
-  const [h, m] = String(str || "").split(":").map(Number);
-  return (isNaN(h) ? 0 : h) * 60 + (isNaN(m) ? 0 : m);
-}
-
-const MIN_SLOT_MINUTES = hhmm_to_minutes(process.env.SLOT_START_HHMM || "15:30");
-const MAX_SLOT_MINUTES = hhmm_to_minutes(process.env.SLOT_END_HHMM || "21:30");
-
-// ── FIX #8: TTL de conversaciones inactivas (default 12 horas) ────────────────
-const CONV_TTL_MS = Number(process.env.CONV_TTL_HOURS || 12) * 60 * 60 * 1000;
-
-// ── FIX #1: Persistencia de estado en disco ───────────────────────────────────
-// Railway tiene un filesystem efímero, pero persiste entre restarts del mismo
-// contenedor. Para deploys nuevos se pierde igual, pero cubre reinicios simples.
-// Cuando tengas Redis disponible, reemplaza load/save por llamadas a Redis.
-const STATE_FILE = process.env.STATE_FILE || "/tmp/conv_state.json";
-
-function loadState() {
-  try {
-    if (existsSync(STATE_FILE)) {
-      const raw = readFileSync(STATE_FILE, "utf8");
-      const obj = JSON.parse(raw);
-      const map = new Map();
-      const now = Date.now();
-      for (const [k, v] of Object.entries(obj)) {
-        // Descarta conversaciones expiradas al cargar
-        if (v._lastActivity && now - v._lastActivity < CONV_TTL_MS) {
-          map.set(k, v);
-        }
-      }
-      console.log(`✅ Estado cargado: ${map.size} conversaciones activas`);
-      return map;
-    }
-  } catch (e) {
-    console.error("No se pudo cargar estado:", e.message);
-  }
-  return new Map();
-}
-
-function saveState(map) {
-  try {
-    const obj = Object.fromEntries(map.entries());
-    writeFileSync(STATE_FILE, JSON.stringify(obj), "utf8");
-  } catch (e) {
-    console.error("No se pudo guardar estado:", e.message);
-  }
-}
-
-// Guarda al disco cada 30 segundos para no bloquear cada request
-let savePending = false;
-function scheduleSave() {
-  if (!savePending) {
-    savePending = true;
-    setTimeout(() => {
-      saveState(conversaciones);
-      savePending = false;
-    }, 30_000);
-  }
-}
-
-const conversaciones = loadState();
-
-// Limpieza de conversaciones viejas cada hora
-setInterval(() => {
-  const now = Date.now();
-  let removed = 0;
-  for (const [k, v] of conversaciones.entries()) {
-    if (!v._lastActivity || now - v._lastActivity > CONV_TTL_MS) {
-      conversaciones.delete(k);
-      removed++;
-    }
-  }
-  if (removed > 0) {
-    console.log(`🧹 Conversaciones expiradas eliminadas: ${removed}`);
-    saveState(conversaciones);
-  }
-}, 60 * 60 * 1000);
-
+const conversaciones = new Map();
 let huliJwt = null;
 let huliJwtExpiry = 0;
 
+// TEMPORAL: seguimos dejando horario declarado, pero NO lo filtraremos
+const ALLOWED_WEEKDAYS = new Set([1, 3, 5]);
+const MIN_SLOT_MINUTES = 15 * 60 + 30;
+const MAX_SLOT_MINUTES = 21 * 60 + 30;
+
 // ══════════════════════════════════════════════════════════════════════════════
-// HELPERS DE TEXTO
+// HELPERS
 // ══════════════════════════════════════════════════════════════════════════════
 
 function normalizeText(text) {
@@ -129,11 +47,14 @@ function normalizeText(text) {
 
 function safeJsonParse(text) {
   if (!text) return null;
+
   try {
     return JSON.parse(text);
   } catch {}
+
   const match = text.match(/\{[\s\S]*\}/);
   if (!match) return null;
+
   try {
     return JSON.parse(match[0]);
   } catch {
@@ -148,38 +69,40 @@ function twiml(message) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&apos;");
+
   return `<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n  <Message>${safe}</Message>\n</Response>`;
 }
 
 async function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = "";
-    req.on("data", (c) => { body += c.toString(); });
+    req.on("data", (c) => {
+      body += c.toString();
+    });
     req.on("end", () => resolve(body));
     req.on("error", reject);
   });
 }
 
-// ── FIX #5: Normalización de teléfono consistente ────────────────────────────
-// Twilio puede enviar: "whatsapp:+521XXXXXXXXXX" o "whatsapp:+52XXXXXXXXXX"
-// Huli espera el número local sin prefijo de país, o el número completo sin +.
-// Esta función devuelve el número E.164 sin '+' (ej: "521XXXXXXXXXX")
-// y también el número local de 10 dígitos para búsqueda más flexible.
-function normalizePhone(raw) {
-  const digits = String(raw || "").replace(/\D/g, "");
-  // E.164 sin '+': "521XXXXXXXXXX" o "52XXXXXXXXXX"
-  const e164 = digits;
-  // Últimos 10 dígitos para búsqueda local
-  const local = digits.slice(-10);
-  return { e164, local, raw: digits };
-}
-
 function isGreeting(text) {
   const t = normalizeText(text);
   return [
-    "hola", "buenas", "buenas tardes", "buen dia", "buenos dias",
-    "buenas noches", "ok", "oki", "gracias", "sale", "va",
-    "si", "sí", "👍", "🙂", "😊",
+    "hola",
+    "buenas",
+    "buenas tardes",
+    "buen dia",
+    "buenos dias",
+    "buenas noches",
+    "ok",
+    "oki",
+    "gracias",
+    "sale",
+    "va",
+    "si",
+    "sí",
+    "👍",
+    "🙂",
+    "😊",
   ].includes(t);
 }
 
@@ -216,22 +139,29 @@ function getConv(phone) {
       manualPreference: "",
       datePreference: null,
       lastIncomingText: "",
-      _lastActivity: Date.now(),
     });
   }
-  const conv = conversaciones.get(phone);
-  conv._lastActivity = Date.now();
-  scheduleSave();
-  return conv;
+
+  return conversaciones.get(phone);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// DETECCIÓN DE PREFERENCIA DE FECHA
+// PREFERENCIA DE FECHA
 // ══════════════════════════════════════════════════════════════════════════════
 
 const MESES = {
-  enero: 1, febrero: 2, marzo: 3, abril: 4, mayo: 5, junio: 6,
-  julio: 7, agosto: 8, septiembre: 9, octubre: 10, noviembre: 11, diciembre: 12,
+  enero: 1,
+  febrero: 2,
+  marzo: 3,
+  abril: 4,
+  mayo: 5,
+  junio: 6,
+  julio: 7,
+  agosto: 8,
+  septiembre: 9,
+  octubre: 10,
+  noviembre: 11,
+  diciembre: 12,
 };
 
 function detectDatePreference(text) {
@@ -241,11 +171,15 @@ function detectDatePreference(text) {
   if (
     t.includes("mes que viene") ||
     t.includes("proximo mes") ||
-    t.includes("proximo mes") ||
+    t.includes("próximo mes") ||
     t.includes("siguiente mes")
   ) {
     const d = new Date(now.getFullYear(), now.getMonth() + 1, 1);
-    return { month: d.getMonth() + 1, year: d.getFullYear(), text: "el mes que viene" };
+    return {
+      month: d.getMonth() + 1,
+      year: d.getFullYear(),
+      text: "el mes que viene",
+    };
   }
 
   const enMesesMatch = t.match(/en\s+(\d+|dos|tres|cuatro)\s+mes/);
@@ -253,7 +187,11 @@ function detectDatePreference(text) {
     const numMap = { dos: 2, tres: 3, cuatro: 4 };
     const n = parseInt(enMesesMatch[1], 10) || numMap[enMesesMatch[1]] || 2;
     const d = new Date(now.getFullYear(), now.getMonth() + n, 1);
-    return { month: d.getMonth() + 1, year: d.getFullYear(), text: enMesesMatch[0] };
+    return {
+      month: d.getMonth() + 1,
+      year: d.getFullYear(),
+      text: enMesesMatch[0],
+    };
   }
 
   for (const [nombre, num] of Object.entries(MESES)) {
@@ -269,7 +207,12 @@ function detectDatePreference(text) {
     const numMap = { dos: 2, tres: 3, cuatro: 4, cinco: 5, seis: 6 };
     const n = parseInt(semanasMatch[1], 10) || numMap[semanasMatch[1]] || 2;
     const d = new Date(now.getTime() + n * 7 * 24 * 60 * 60 * 1000);
-    return { month: d.getMonth() + 1, year: d.getFullYear(), fromDate: d, text: semanasMatch[0] };
+    return {
+      month: d.getMonth() + 1,
+      year: d.getFullYear(),
+      fromDate: d,
+      text: semanasMatch[0],
+    };
   }
 
   return null;
@@ -289,10 +232,12 @@ function datePreferenceToRange(pref) {
   if (pref?.month && pref?.year) {
     const from = new Date(pref.year, pref.month - 1, 1, 8, 0, 0, 0);
     const to = new Date(pref.year, pref.month, 0, 23, 59, 59, 0);
+
     if (from < now) {
       from.setTime(now.getTime());
       from.setHours(now.getHours() + 2, 0, 0, 0);
     }
+
     return { from, to };
   }
 
@@ -306,9 +251,6 @@ function datePreferenceToRange(pref) {
 // ══════════════════════════════════════════════════════════════════════════════
 // HULI API
 // ══════════════════════════════════════════════════════════════════════════════
-
-const huliDisponible = () =>
-  !!(HULI_API_KEY && HULI_ORG_ID && HULI_DOCTOR_ID && HULI_CLINIC_ID);
 
 async function huliGetToken() {
   if (huliJwt && Date.now() < huliJwtExpiry) return huliJwt;
@@ -355,17 +297,9 @@ async function huliRequest(method, path, body = null) {
   return data;
 }
 
+// TEMPORAL: NO filtramos slots para ver TODO lo que devuelve Huli
 function isAllowedSlot(slot) {
-  if (!slot?.date || !slot?.time) return false;
-  const dt = new Date(`${slot.date}T${slot.time}`);
-  if (Number.isNaN(dt.getTime())) return false;
-  const weekday = dt.getDay();
-  const minutes = dt.getHours() * 60 + dt.getMinutes();
-  return (
-    ALLOWED_WEEKDAYS.has(weekday) &&
-    minutes >= MIN_SLOT_MINUTES &&
-    minutes <= MAX_SLOT_MINUTES
-  );
+  return !!(slot?.date && slot?.time);
 }
 
 async function huliGetSlotsInRange(from, to) {
@@ -385,11 +319,13 @@ async function huliGetSlotsInRange(from, to) {
         time_l10n: slot.time_l10n,
         source_event: slot.source_event,
       };
+
       if (!isAllowedSlot(candidate)) continue;
+
       slots.push(candidate);
-      if (slots.length >= 20) break;
+      if (slots.length >= 50) break;
     }
-    if (slots.length >= 20) break;
+    if (slots.length >= 50) break;
   }
 
   return slots;
@@ -403,27 +339,15 @@ async function huliGetSlots(days = 14) {
   return huliGetSlotsInRange(from, to);
 }
 
-// ── FIX #5: huliFindPatient busca por número local Y E.164 ───────────────────
-async function huliFindPatient(rawPhone) {
+async function huliFindPatient(phone) {
   try {
-    const { local, e164 } = normalizePhone(rawPhone);
-
-    // Intenta primero con los últimos 10 dígitos (más flexible)
-    for (const query of [local, e164]) {
-      if (!query) continue;
-      const data = await huliRequest(
-        "GET",
-        `/practice/v2/patient-file?query=${query}&limit=5`
-      );
-      const found = data.patientFiles?.[0]?.id;
-      if (found) {
-        console.log(`✅ Paciente encontrado con query "${query}": ${found}`);
-        return found;
-      }
-    }
-    return null;
-  } catch (e) {
-    console.error("huliFindPatient error:", e.message);
+    const clean = String(phone || "").replace(/\D/g, "");
+    const data = await huliRequest(
+      "GET",
+      `/practice/v2/patient-file?query=${clean}&limit=5`
+    );
+    return data.patientFiles?.[0]?.id || null;
+  } catch {
     return null;
   }
 }
@@ -431,14 +355,13 @@ async function huliFindPatient(rawPhone) {
 async function huliCreatePatient(patient) {
   const [firstName, ...rest] = (patient.nombre || "Sin nombre").split(" ");
   const lastName = rest.join(" ") || "-";
-
-  // ── FIX #5: usa normalizePhone para el teléfono del paciente ─────────────
-  const { local } = normalizePhone(patient.telefono);
+  const phone = String(patient.telefono || "").replace(/\D/g, "");
 
   let dob = null;
   const m = String(patient.fechaNacimiento || "").match(
     /(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/
   );
+
   if (m) {
     const y = m[3].length === 2 ? `20${m[3]}` : m[3];
     dob = `${y}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
@@ -451,7 +374,7 @@ async function huliCreatePatient(patient) {
       ...(dob ? { date_of_birth: dob } : {}),
     },
     contact: {
-      phones: [{ type: "MOBILE", phone_number: local, id_country: 484 }],
+      phones: [{ type: "MOBILE", phone_number: phone, id_country: 484 }],
     },
   };
 
@@ -468,7 +391,9 @@ async function huliCreateAppointment(slot, patientFileId, motivo) {
     source_event: slot.source_event,
     notes: motivo || "Cita agendada por WhatsApp",
     is_first_time_patient: !patientFileId,
-    ...(patientFileId ? { id_patient_file: parseInt(patientFileId, 10) } : {}),
+    ...(patientFileId
+      ? { id_patient_file: parseInt(patientFileId, 10) }
+      : {}),
   };
 
   return huliRequest("POST", "/practice/v2/appointment", body);
@@ -526,15 +451,13 @@ async function callOAI(messages, temp = 0.2, tokens = 300) {
 
   const raw = await res.text();
   const data = safeJsonParse(raw);
+
   if (!data) throw new Error(`OpenAI sin JSON: ${raw}`);
   if (!res.ok) throw new Error(`OpenAI ${res.status}: ${raw}`);
 
   return data?.choices?.[0]?.message?.content?.trim() || "";
 }
 
-// ── FIX #3: el clasificador es la fuente de verdad para intenciones ───────────
-// Los detectores de keywords en route() se usan solo como fallback rápido
-// cuando no hay API key. Con API key, se confía en cls primero.
 async function classify(state, msg) {
   if (!OPENAI_API_KEY) return null;
 
@@ -562,8 +485,6 @@ Reglas:
 - date_preference: si menciona un mes, "mes que viene", "en 2 semanas", etc. Pon el texto exacto
 - slot_choice: "1" o "2" si elige horario
 - patient_dob: DD/MM/YYYY
-- patient_name: solo si es CLARAMENTE un nombre de persona, no una pregunta ni frase
-- is_priority: sangrado abundante, dolor intenso, fiebre en embarazo, no siente movimientos, parto, cesárea
 Sin explicaciones fuera del JSON.`;
 
   try {
@@ -572,22 +493,28 @@ Sin explicaciones fuera del JSON.`;
         { role: "system", content: prompt },
         {
           role: "user",
-          content: JSON.stringify({ stage: state.stage, msg, patient: state.patient }),
+          content: JSON.stringify({
+            stage: state.stage,
+            msg,
+            patient: state.patient,
+          }),
         },
       ],
       0.1,
       240
     );
+
     return safeJsonParse(txt);
-  } catch (e) {
-    console.error("Classifier error:", e.message);
+  } catch {
     return null;
   }
 }
 
 async function writerReply(state, msg) {
   state.messages.push({ role: "user", content: msg });
-  if (state.messages.length > 16) state.messages.splice(0, state.messages.length - 16);
+  if (state.messages.length > 16) {
+    state.messages.splice(0, state.messages.length - 16);
+  }
 
   const reply = await callOAI(
     [{ role: "system", content: SYSTEM_PROMPT }, ...state.messages],
@@ -596,7 +523,9 @@ async function writerReply(state, msg) {
   );
 
   state.messages.push({ role: "assistant", content: reply });
-  if (state.messages.length > 16) state.messages.splice(0, state.messages.length - 16);
+  if (state.messages.length > 16) {
+    state.messages.splice(0, state.messages.length - 16);
+  }
 
   return reply || "Claro 😊 Soy el asistente del Dr. Ricardo Cid Trejo. ¿En qué te puedo apoyar?";
 }
@@ -623,7 +552,13 @@ Termina diciendo que si es urgente o quiere hablar con el doctor directamente, l
     return await callOAI(
       [
         { role: "system", content: prompt },
-        { role: "user", content: JSON.stringify({ patient: state.patient, message: msg }) },
+        {
+          role: "user",
+          content: JSON.stringify({
+            patient: state.patient,
+            message: msg,
+          }),
+        },
       ],
       0.5,
       280
@@ -638,21 +573,36 @@ Si sientes que es urgente, dime y le notifico al doctor directamente.`;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// DETECTORES DE KEYWORDS
-// ── FIX #3: Estos detectores son fallback cuando no hay cls (sin API key).
-//    Con API key, cls tiene prioridad. Se eliminó duplicación de lógica.
+// DETECTORES
 // ══════════════════════════════════════════════════════════════════════════════
 
 function isPriority(t) {
   t = normalizeText(t);
   return [
-    "parto", "cesarea", "urgencia", "urgente", "sangrado abundante",
-    "mucho sangrado", "dolor intenso", "dolor fuerte", "dolor insoportable",
-    "fiebre", "embarazo ectopico", "emergencia", "no se mueve mi bebe",
-    "ya no se mueve mi bebe", "no siento movimientos", "no siento a mi bebe",
-    "dejo de moverse", "dejo de sentir a mi bebe", "no he sentido movimientos",
-    "hoy no he sentido movimientos", "no lo siento moverse",
-    "mi bebe no se mueve", "ya no lo siento", "no siento que se mueva mi bebe",
+    "parto",
+    "cesarea",
+    "urgencia",
+    "urgente",
+    "sangrado abundante",
+    "mucho sangrado",
+    "dolor intenso",
+    "dolor fuerte",
+    "dolor insoportable",
+    "fiebre",
+    "embarazo ectopico",
+    "emergencia",
+    "no se mueve mi bebe",
+    "ya no se mueve mi bebe",
+    "no siento movimientos",
+    "no siento a mi bebe",
+    "dejo de moverse",
+    "dejo de sentir a mi bebe",
+    "no he sentido movimientos",
+    "hoy no he sentido movimientos",
+    "no lo siento moverse",
+    "mi bebe no se mueve",
+    "ya no lo siento",
+    "no siento que se mueva mi bebe",
     "casi no se mueve mi bebe",
   ].some((k) => t.includes(k));
 }
@@ -660,77 +610,106 @@ function isPriority(t) {
 function wantsAppointment(t) {
   t = normalizeText(t);
   return [
-    "quiero una cita", "quiero cita", "agendar", "hacer una cita",
-    "sacar una cita", "disponible", "que dia tiene", "tiene lugar",
-    "puedo ir", "cuando puede", "necesito cita", "quisiera cita",
-    "quiero agendar", "tiene horarios", "que horarios tiene",
-    "cuando tiene citas", "como saco cita", "como agendo",
-    "quiero ir a revision", "me puede ver",
+    "quiero una cita",
+    "quiero cita",
+    "agendar",
+    "hacer una cita",
+    "sacar una cita",
+    "disponible",
+    "que dia tiene",
+    "tiene lugar",
+    "puedo ir",
+    "cuando puede",
+    "necesito cita",
+    "quisiera cita",
+    "quiero agendar",
+    "tiene horarios",
+    "que horarios tiene",
+    "cuando tiene citas",
+    "como saco cita",
+    "como agendo",
+    "quiero ir a revision",
+    "me puede ver",
   ].some((k) => t.includes(k));
 }
 
 function wantsPrice(t) {
   t = normalizeText(t);
   return [
-    "precio", "cuanto cuesta", "costo", "cuanto sale",
-    "cuanto cobra", "que precio tiene",
+    "precio",
+    "cuanto cuesta",
+    "costo",
+    "cuanto sale",
+    "cuanto cobra",
+    "que precio tiene",
   ].some((k) => t.includes(k));
 }
 
 function wantsInfo(t) {
   t = normalizeText(t);
   return [
-    "tengo una duda", "una duda", "quiero informacion", "quisiera informacion",
-    "quiero preguntar", "tengo una pregunta", "informes",
-    "me puede orientar", "tengo sintomas", "tengo molestia",
-    "tengo flujo", "tengo dolor", "tengo sangrado", "duda de",
+    "tengo una duda",
+    "una duda",
+    "quiero informacion",
+    "quisiera informacion",
+    "quiero preguntar",
+    "tengo una pregunta",
+    "informes",
+    "me puede orientar",
+    "tengo sintomas",
+    "tengo molestia",
+    "tengo flujo",
+    "tengo dolor",
+    "tengo sangrado",
+    "duda de",
   ].some((k) => t.includes(k));
 }
 
 function asksIfDoctor(t) {
   t = normalizeText(t);
   return [
-    "hablo con el dr", "hablo con el doctor", "hablo con el dr cid",
-    "es el dr cid", "es usted el doctor", "usted es el doctor",
-    "eres el doctor", "es el doctor ricardo",
+    "hablo con el dr",
+    "hablo con el doctor",
+    "hablo con el dr cid",
+    "es el dr cid",
+    "es usted el doctor",
+    "usted es el doctor",
+    "eres el doctor",
+    "es el doctor ricardo",
   ].some((k) => t.includes(k));
 }
 
 function wantsDoctorDirect(t) {
   t = normalizeText(t);
   return [
-    "hablar con el doctor", "hablar directamente con el doctor",
-    "quiero hablar con el doctor", "comunicarme con el doctor",
-    "quiero hablar con el dr", "me puede pasar con el doctor",
-    "me comunicas con el doctor", "quiero hablar directamente con el dr",
-    "pasame con el doctor", "pasame con el doctor",
+    "hablar con el doctor",
+    "hablar directamente con el doctor",
+    "quiero hablar con el doctor",
+    "comunicarme con el doctor",
+    "quiero hablar con el dr",
+    "me puede pasar con el doctor",
+    "me comunicas con el doctor",
+    "quiero hablar directamente con el dr",
+    "pasame con el doctor",
+    "pásame con el doctor",
   ].some((k) => t.includes(k));
 }
 
 function cantMakeIt(t) {
   t = normalizeText(t);
   return [
-    "no puedo", "no me queda", "otro horario", "otra hora",
-    "no me acomoda", "diferente", "ninguno", "mas tarde",
-    "mas temprano", "otro dia", "otra fecha",
+    "no puedo",
+    "no me queda",
+    "otro horario",
+    "otra hora",
+    "no me acomoda",
+    "diferente",
+    "ninguno",
+    "mas tarde",
+    "mas temprano",
+    "otro dia",
+    "otra fecha",
   ].some((k) => t.includes(k));
-}
-
-// ── FIX #3: Función central para resolver intención combinando cls + keywords ─
-// Con API key: cls tiene prioridad total.
-// Sin API key: solo keywords.
-function resolveIntent(msg, cls) {
-  const hasCls = !!cls;
-  return {
-    priority:       hasCls ? (cls.is_priority || false)           : isPriority(msg),
-    appointment:    hasCls ? (cls.wants_appointment || false)     : wantsAppointment(msg),
-    price:          hasCls ? (cls.wants_price || false)           : wantsPrice(msg),
-    info:           hasCls ? (cls.wants_info || false)            : wantsInfo(msg),
-    doctorDirect:   hasCls ? (cls.wants_doctor_direct || false)   : wantsDoctorDirect(msg),
-    asksDoctor:     hasCls ? (cls.asks_if_doctor || false)        : asksIfDoctor(msg),
-    cantMakeIt:     hasCls ? (cls.cant_make_it || false)          : cantMakeIt(msg),
-    slotChoice:     cls?.slot_choice || null,
-  };
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -746,49 +725,67 @@ function nextMissingField(state) {
 
 function buildNextDataQuestion(state) {
   const next = nextMissingField(state);
-  if (next === "nombre") return "Para dejarte registrada, ¿me compartes tu nombre completo?";
-  if (next === "fechaNacimiento") return "Gracias 😊 ¿Me compartes tu fecha de nacimiento?\nEjemplo: 14/08/1995";
-  if (next === "motivo") return "Muy bien 😊 ¿Me dices brevemente el motivo de la consulta?";
+
+  if (next === "nombre") {
+    return "Para dejarte registrada, ¿me compartes tu nombre completo?";
+  }
+
+  if (next === "fechaNacimiento") {
+    return "Gracias 😊 ¿Me compartes tu fecha de nacimiento?\nEjemplo: 14/08/1995";
+  }
+
+  if (next === "motivo") {
+    return "Muy bien 😊 ¿Me dices brevemente el motivo de la consulta?";
+  }
+
   return null;
 }
 
-// ── FIX #2: looksLikeRealName más tolerante ───────────────────────────────────
-// Acepta nombres de 2 a 7 palabras (cubre "María de los Ángeles García Pérez")
-// y permite partículas como de, del, la, los, las, el
 function looksLikeRealName(text) {
   const clean = String(text || "").trim();
   const n = normalizeText(clean);
 
-  if (!clean || clean.includes("?") || clean.length < 4 || clean.length > 80) return false;
+  if (!clean || clean.includes("?") || clean.length < 5 || clean.length > 60) {
+    return false;
+  }
 
   const blocked = [
-    "precio", "cuesta", "costo", "cita", "consulta", "duda", "horario",
-    "doctor", "ultrasonido", "embarazo", "dolor", "sangrado", "quiero",
-    "tengo", "para", "pero", "motivo", "informacion", "pregunta",
-    "mes que viene", "proximo mes", "siguiente mes", "en 2 semanas",
-    "cuando", "como", "donde", "que dia", "que hora",
+    "precio",
+    "cuesta",
+    "costo",
+    "cita",
+    "consulta",
+    "duda",
+    "horario",
+    "doctor",
+    "ultrasonido",
+    "embarazo",
+    "dolor",
+    "sangrado",
+    "quiero",
+    "tengo",
+    "para",
+    "pero",
+    "motivo",
+    "informacion",
+    "pregunta",
+    "mes que viene",
+    "proximo mes",
+    "siguiente mes",
+    "en 2 semanas",
   ];
 
   if (blocked.some((w) => n.includes(w))) return false;
 
   const words = clean.split(/\s+/).filter(Boolean);
+  if (words.length < 2 || words.length > 4) return false;
 
-  // ── FIX #2: de 2 a 7 palabras, partículas permitidas ─────────────────────
-  if (words.length < 2 || words.length > 7) return false;
-
-  const particulas = new Set(["de", "del", "la", "las", "los", "el", "y"]);
-
-  return words.every(
-    (w) =>
-      particulas.has(w.toLowerCase()) ||
-      (/^[A-Za-zÀ-ÿÑñ]+$/.test(w) && w.length >= 2)
-  );
+  return words.every((w) => /^[A-Za-zÀ-ÿÑñ]+$/.test(w) && w.length >= 2);
 }
 
 function extractData(state, text, fromPhone) {
   if (!state.patient.telefono) {
-    const { e164 } = normalizePhone(fromPhone);
-    state.patient.telefono = e164;
+    state.patient.telefono = String(fromPhone || "").replace("whatsapp:", "");
   }
 
   const clean = String(text || "").trim();
@@ -817,9 +814,25 @@ function extractData(state, text, fromPhone) {
   }
 
   const motivoKw = [
-    "embarazo", "revision", "ultrasonido", "dolor", "sangrado", "infeccion",
-    "planificacion", "quiste", "mioma", "papanicolaou", "pap", "menstruacion",
-    "regla", "colposcop", "chequeo", "general", "flujo", "comezon", "ardor",
+    "embarazo",
+    "revision",
+    "ultrasonido",
+    "dolor",
+    "sangrado",
+    "infeccion",
+    "planificacion",
+    "quiste",
+    "mioma",
+    "papanicolaou",
+    "pap",
+    "menstruacion",
+    "regla",
+    "colposcop",
+    "chequeo",
+    "general",
+    "flujo",
+    "comezon",
+    "ardor",
   ];
 
   if (!state.patient.motivo && motivoKw.some((k) => n.includes(k))) {
@@ -878,7 +891,9 @@ Ya le avisamos que la contactarán.`,
   };
 
   try {
-    const creds = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+    const creds = Buffer.from(
+      `${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`
+    ).toString("base64");
 
     const resp = await fetch(
       `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`,
@@ -919,17 +934,28 @@ function formatSlots(slots) {
 
 function detectSlotChoice(msg, cls, slots) {
   if (!slots?.length) return null;
+
   const t = normalizeText(msg);
 
   if (
-    t === "1" || t.startsWith("1 ") || t.startsWith("el 1") ||
-    t.includes("primera") || t.includes("primer")
-  ) return slots[0] || null;
+    t === "1" ||
+    t.startsWith("1 ") ||
+    t.startsWith("el 1") ||
+    t.includes("primera") ||
+    t.includes("primer")
+  ) {
+    return slots[0] || null;
+  }
 
   if (
-    t === "2" || t.startsWith("2 ") || t.startsWith("el 2") ||
-    t.includes("segunda") || t.includes("segundo")
-  ) return slots[1] || null;
+    t === "2" ||
+    t.startsWith("2 ") ||
+    t.startsWith("el 2") ||
+    t.includes("segunda") ||
+    t.includes("segundo")
+  ) {
+    return slots[1] || null;
+  }
 
   if (cls?.slot_choice === "1") return slots[0] || null;
   if (cls?.slot_choice === "2") return slots[1] || null;
@@ -940,7 +966,9 @@ function detectSlotChoice(msg, cls, slots) {
       t.includes(timeHH) ||
       t.includes(normalizeText(slot.time_l10n)) ||
       t.includes(normalizeText(slot.date_l10n))
-    ) return slot;
+    ) {
+      return slot;
+    }
   }
 
   return null;
@@ -973,7 +1001,6 @@ En breve el consultorio te contactará para confirmarte tu horario.
 Cualquier duda, aquí me quedo al pendiente 🙂`;
 }
 
-// ── FIX #4: ofrecerHorarios con error handling explícito y mensajes claros ───
 async function ofrecerHorarios(state, datePreference = null) {
   if (!huliDisponible()) {
     state.stage = "datos_manual";
@@ -982,17 +1009,32 @@ async function ofrecerHorarios(state, datePreference = null) {
 
   try {
     let slots = [];
+    let contextMsg = "";
 
     if (datePreference) {
       const { from, to } = datePreferenceToRange(datePreference);
       console.log(
-        `Buscando slots para "${datePreference.text}" de ${from.toISOString()} a ${to.toISOString()}`
+        `Buscando slots para preferencia "${datePreference.text}" de ${from.toISOString()} a ${to.toISOString()}`
       );
       slots = await huliGetSlotsInRange(from, to);
-      console.log(`Slots recibidos: ${slots.length}`);
+      contextMsg = `Para ${datePreference.text} `;
+    } else {
+      slots = await huliGetSlots(14);
+    }
 
-      if (!slots.length) {
-        // Fallback: busca en los próximos 90 días
+    console.log("──────── DIAGNÓSTICO HULI ────────");
+    console.log("Slots recibidos:", slots.length);
+    console.log("Primeros 10 slots:", JSON.stringify(slots.slice(0, 10), null, 2));
+    console.log("Filtro temporal activo: NO se filtran horarios");
+    console.log("Horario esperado local:", {
+      days: Array.from(ALLOWED_WEEKDAYS),
+      min: MIN_SLOT_MINUTES,
+      max: MAX_SLOT_MINUTES,
+    });
+    console.log("──────────────────────────────────");
+
+    if (!slots.length) {
+      if (datePreference) {
         const fallbackSlots = await huliGetSlots(90);
         if (fallbackSlots.length) {
           state.slots = fallbackSlots.slice(0, 2);
@@ -1003,33 +1045,23 @@ ${formatSlots(state.slots)}
 
 ¿Alguno te funciona? (1 o 2)`;
         }
-        // Sin slots en ningún rango
-        state.stage = "datos_manual";
-        return await pedirDatosYEsperarManual(state);
       }
-    } else {
-      slots = await huliGetSlots(14);
-      console.log(`Slots recibidos: ${slots.length}`);
 
-      if (!slots.length) {
-        state.stage = "datos_manual";
-        return await pedirDatosYEsperarManual(state);
-      }
+      state.stage = "datos_manual";
+      return await pedirDatosYEsperarManual(state);
     }
 
     state.slots = slots.slice(0, 2);
     const intro = datePreference
-      ? `Para ${datePreference.text} tengo disponibilidad en:`
+      ? `${contextMsg}tengo disponibilidad en:`
       : "Tengo disponibilidad en:";
 
     return `${intro}
 ${formatSlots(state.slots)}
 
 ¿Cuál te queda mejor? (responde 1 o 2)`;
-
   } catch (e) {
-    // ── FIX #4: error de Huli loggeado y fallback claro ──────────────────────
-    console.error("❌ Huli slots error:", e.message);
+    console.error("Huli slots error:", e.message);
     state.stage = "datos_manual";
     return await pedirDatosYEsperarManual(state);
   }
@@ -1080,21 +1112,15 @@ ${formatSlots(state.slots)}
     state.stage = "datos_manual";
     return await pedirDatosYEsperarManual(state);
   } catch (e) {
-    console.error("❌ Huli alt slots error:", e.message);
+    console.error("Huli alt slots error:", e.message);
     state.stage = "datos_manual";
     return await pedirDatosYEsperarManual(state);
   }
 }
 
-// ── FIX #7: ofrecerPrecioYHorarios ya no repite precio si ya se dio ───────────
 async function ofrecerPrecioYHorarios(state, datePreference = null) {
   const slotsMsg = await ofrecerHorarios(state, datePreference);
 
-  if (state.flags.yaDimosPrecio) {
-    return slotsMsg;
-  }
-
-  state.flags.yaDimosPrecio = true;
   return `La consulta incluye valoración completa y ultrasonido 😊
 
 El costo es ${CONSULTA_PRECIO}.
@@ -1116,7 +1142,11 @@ async function agendarCita(state) {
       console.log("✅ Paciente existente:", patientFileId);
     }
 
-    const appt = await huliCreateAppointment(slot, patientFileId, state.patient.motivo);
+    const appt = await huliCreateAppointment(
+      slot,
+      patientFileId,
+      state.patient.motivo
+    );
     console.log("✅ Cita creada:", appt?.id || appt);
 
     if (!state.flags.notificado) {
@@ -1150,23 +1180,25 @@ Cualquier duda, aquí me quedo al pendiente 🙂`;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// ROUTER PRINCIPAL
+// ROUTER
 // ══════════════════════════════════════════════════════════════════════════════
 
 async function route(state, msg, fromPhone, cls) {
   state.lastIncomingText = msg;
   extractData(state, msg, fromPhone);
 
-  // ── FIX #3: cls tiene prioridad sobre extractData para datos del paciente ──
   if (cls?.patient_name && !state.patient.nombre) {
     state.patient.nombre = cls.patient_name.trim();
   }
+
   if (cls?.patient_dob && !state.patient.fechaNacimiento) {
     state.patient.fechaNacimiento = cls.patient_dob.trim();
   }
+
   if (cls?.patient_reason && !state.patient.motivo) {
     state.patient.motivo = cls.patient_reason.trim();
   }
+
   if (cls?.preferred_schedule) {
     state.manualPreference = cls.preferred_schedule;
   }
@@ -1175,53 +1207,49 @@ async function route(state, msg, fromPhone, cls) {
     detectDatePreference(msg) ||
     (cls?.date_preference ? detectDatePreference(cls.date_preference) : null);
 
-  if (datePref) state.datePreference = datePref;
+  if (datePref) {
+    state.datePreference = datePref;
+  }
 
-  // ── FIX #3: resolveIntent como fuente única de verdad ────────────────────
-  const intent = resolveIntent(msg, cls);
-
-  // URGENCIA
-  if (intent.priority || intent.doctorDirect) {
+  if (isPriority(msg) || cls?.is_priority || wantsDoctorDirect(msg) || cls?.wants_doctor_direct) {
     state.stage = "prioridad";
     notifyDoctor("URGENCIA", state, msg).catch(console.error);
+
     return `Por lo que me comentas es importante que el doctor lo valore directamente 🙏
 
 En un momento te apoyamos para darte atención prioritaria.
 Si puedes, cuéntame brevemente cómo te sientes.`;
   }
 
-  // ¿PREGUNTA SI HABLA CON EL DOCTOR?
-  if (state.stage === "idle" && intent.asksDoctor) {
+  if (state.stage === "idle" && (asksIfDoctor(msg) || cls?.asks_if_doctor)) {
     return buildDoctorIdentityReply();
   }
 
-  // SALUDO INICIAL
   if (state.stage === "idle" && isGreeting(msg)) {
     return buildWelcomeMessage();
   }
 
-  // DUDA MÉDICA INICIAL
-  if (state.stage === "idle" && intent.info) {
+  if (state.stage === "idle" && (wantsInfo(msg) || cls?.wants_info)) {
     state.stage = "duda";
     return `Claro 😊 Soy el asistente del Dr. Ricardo Cid Trejo.
 
 Cuéntame qué está pasando o qué síntomas tienes, y con gusto te apoyo.`;
   }
 
-  // ETAPA DUDA
   if (state.stage === "duda") {
-    if (intent.appointment) {
+    if (wantsAppointment(msg) || cls?.wants_appointment) {
       if (!state.patient.motivo) {
         state.stage = "motivo";
         return `Claro, con gusto te ayudo a agendar 😊
 
 ¿Me puedes decir brevemente el motivo de la consulta?`;
       }
+
       state.stage = "horario";
       return await ofrecerHorarios(state, state.datePreference || null);
     }
 
-    if (intent.price) {
+    if (wantsPrice(msg) || cls?.wants_price) {
       state.flags.yaDimosPrecio = true;
       return `Claro 😊 La consulta incluye valoración completa y ultrasonido.
 
@@ -1237,16 +1265,14 @@ Si gustas, también te puedo ayudar a agendar tu cita.`;
     return await answerMedicalDoubt(state, msg);
   }
 
-  // ESPERA CONFIRMACIÓN
   if (state.stage === "espera_confirmacion") {
     return `Ya tenemos tus datos y el consultorio te contactará pronto para confirmar tu horario 😊
 
 Cualquier duda, aquí me quedo al pendiente.`;
   }
 
-  // DATOS MANUAL
   if (state.stage === "datos_manual") {
-    if (intent.price && !state.flags.yaDimosPrecio) {
+    if (wantsPrice(msg) || cls?.wants_price) {
       state.flags.yaDimosPrecio = true;
       return `Claro 😊 La consulta incluye valoración completa y ultrasonido.
 
@@ -1260,32 +1286,39 @@ ${buildNextDataQuestion(state) || ""}`;
     return await confirmarEsperaManual(state);
   }
 
-  // PRECIO SIN MOTIVO
-  if (intent.price && !state.flags.pidioPrecio && !state.patient.motivo) {
+  if (
+    (wantsPrice(msg) || cls?.wants_price) &&
+    !state.flags.pidioPrecio &&
+    !state.patient.motivo
+  ) {
     state.flags.pidioPrecio = true;
     state.stage = "precio_q";
+
     return `Hola 😊 con gusto te ayudo.
 
 ¿Es para revisión general, embarazo o traes alguna molestia en particular?`;
   }
 
-  // PRECIO CON MOTIVO
-  if (intent.price && !state.flags.yaDimosPrecio && state.patient.motivo) {
+  if (
+    (wantsPrice(msg) || cls?.wants_price) &&
+    !state.flags.yaDimosPrecio &&
+    state.patient.motivo
+  ) {
     state.flags.yaDimosPrecio = true;
     state.stage = "horario";
     return await ofrecerPrecioYHorarios(state, state.datePreference || null);
   }
 
-  // RESPUESTA A PRECIO_Q
   if (state.stage === "precio_q" && msg.trim().length > 3 && !isGreeting(msg)) {
-    if (!state.patient.motivo) state.patient.motivo = msg.trim().slice(0, 200);
+    if (!state.patient.motivo) {
+      state.patient.motivo = msg.trim().slice(0, 200);
+    }
     state.flags.yaDimosPrecio = true;
     state.stage = "horario";
     return await ofrecerPrecioYHorarios(state, state.datePreference || null);
   }
 
-  // QUIERE AGENDAR
-  if (intent.appointment) {
+  if (wantsAppointment(msg) || cls?.wants_appointment) {
     if (datePref && !state.patient.motivo) {
       state.stage = "motivo";
       return `Claro, con gusto te ayudo a agendar para ${datePref.text} 😊
@@ -1304,32 +1337,34 @@ ${buildNextDataQuestion(state) || ""}`;
     return await ofrecerHorarios(state, state.datePreference || null);
   }
 
-  // ETAPA MOTIVO
   if (state.stage === "motivo") {
     if (!isGreeting(msg) && msg.trim().length > 3) {
-      if (!state.patient.motivo) state.patient.motivo = msg.trim().slice(0, 200);
+      if (!state.patient.motivo) {
+        state.patient.motivo = msg.trim().slice(0, 200);
+      }
       state.stage = "horario";
       return await ofrecerHorarios(state, state.datePreference || null);
     }
+
     return `Con gusto 😊
 
 ¿Me puedes decir brevemente el motivo de la consulta?`;
   }
 
-  // ETAPA HORARIO
   if (state.stage === "horario") {
     if (datePref) {
       state.datePreference = datePref;
       return await ofrecerHorarios(state, datePref);
     }
 
-    if (intent.cantMakeIt) {
+    if (cantMakeIt(msg) || cls?.cant_make_it) {
       return await ofrecerHorariosAlternativos(state, msg, cls);
     }
 
     const chosen = detectSlotChoice(msg, cls, state.slots);
     if (chosen) {
       state.chosenSlot = chosen;
+
       const next = buildNextDataQuestion(state);
       if (next) {
         state.stage = "datos";
@@ -1337,6 +1372,7 @@ ${buildNextDataQuestion(state) || ""}`;
 
 ${next}`;
       }
+
       return await agendarCita(state);
     }
 
@@ -1349,14 +1385,12 @@ ${formatSlots(state.slots)}`;
 ${formatSlots(state.slots)}`;
   }
 
-  // ETAPA DATOS
   if (state.stage === "datos") {
     const q = buildNextDataQuestion(state);
     if (q) return q;
     return await agendarCita(state);
   }
 
-  // FALLBACK
   if (!OPENAI_API_KEY) {
     return "Claro 😊 Soy el asistente del Dr. Ricardo Cid Trejo. ¿En qué te puedo apoyar?";
   }
@@ -1369,7 +1403,7 @@ ${formatSlots(state.slots)}`;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// SERVIDOR
+// SERVER
 // ══════════════════════════════════════════════════════════════════════════════
 
 const server = createServer(async (req, res) => {
@@ -1377,6 +1411,53 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && req.url === "/") {
       res.writeHead(200, { "Content-Type": "text/plain;charset=utf-8" });
       res.end("Bot Dr. Cid + Huli activo ✓");
+      return;
+    }
+
+    // ENDPOINT TEMPORAL DE DIAGNÓSTICO HULI
+    if (req.method === "GET" && req.url === "/test-huli") {
+      try {
+        const from = new Date("2026-04-14T00:00:00-06:00");
+        const to = new Date("2026-04-19T23:59:59-06:00");
+
+        const path =
+          `/practice/v2/availability/doctor/${HULI_DOCTOR_ID}/clinic/${HULI_CLINIC_ID}` +
+          `?from=${from.toISOString()}&to=${to.toISOString()}`;
+
+        const data = await huliRequest("GET", path);
+
+        const simplified = (data.availability || []).map((day) => ({
+          date: day.date,
+          date_l10n: day.date_l10n,
+          slots: (day.slots || []).map((slot) => ({
+            time: slot.time,
+            time_l10n: slot.time_l10n,
+            source_event: slot.source_event,
+          })),
+        }));
+
+        const response = {
+          timezone_info: {
+            now_server: new Date().toString(),
+            now_iso: new Date().toISOString(),
+            note: "Este endpoint es temporal para revisar cómo viene Huli",
+          },
+          doctor_id: HULI_DOCTOR_ID,
+          clinic_id: HULI_CLINIC_ID,
+          requested_range: {
+            from: from.toISOString(),
+            to: to.toISOString(),
+          },
+          raw_availability_count: (data.availability || []).length,
+          simplified,
+        };
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(response, null, 2));
+      } catch (e) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }, null, 2));
+      }
       return;
     }
 
@@ -1394,7 +1475,10 @@ const server = createServer(async (req, res) => {
 
       if (!msg) {
         const xml = twiml(buildWelcomeMessage());
-        res.writeHead(200, { "Content-Type": "text/xml;charset=utf-8", "Content-Length": Buffer.byteLength(xml) });
+        res.writeHead(200, {
+          "Content-Type": "text/xml;charset=utf-8",
+          "Content-Length": Buffer.byteLength(xml),
+        });
         res.end(xml);
         return;
       }
@@ -1412,33 +1496,27 @@ const server = createServer(async (req, res) => {
       console.log(`[Stage:${state.stage}] Reply:${reply.slice(0, 120)}`);
 
       const xml = twiml(reply);
-      res.writeHead(200, { "Content-Type": "text/xml;charset=utf-8", "Content-Length": Buffer.byteLength(xml) });
+      res.writeHead(200, {
+        "Content-Type": "text/xml;charset=utf-8",
+        "Content-Length": Buffer.byteLength(xml),
+      });
       res.end(xml);
       return;
     }
-if (req.method === "GET" && req.url === "/test-huli") {
-  try {
-    const token = await huliGetToken();
-    const from = new Date();
-    from.setHours(from.getHours() + 1, 0, 0, 0);
-    const to = new Date(from);
-    to.setDate(to.getDate() + 30);
-    const path = `/practice/v2/availability/doctor/${HULI_DOCTOR_ID}/clinic/${HULI_CLINIC_ID}?from=${from.toISOString()}&to=${to.toISOString()}`;
-    const data = await huliRequest("GET", path);
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(data, null, 2));
-  } catch (e) {
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: e.message }));
-  }
-  return;
-}
+
     res.writeHead(404, { "Content-Type": "text/plain;charset=utf-8" });
     res.end("Not found");
   } catch (err) {
     console.error("SERVER ERROR:", err);
-    const fallback = twiml("Hola 😊 Tuvimos una falla temporal. ¿Te ayudamos a programar tu cita?");
-    res.writeHead(200, { "Content-Type": "text/xml;charset=utf-8", "Content-Length": Buffer.byteLength(fallback) });
+
+    const fallback = twiml(
+      "Hola 😊 Tuvimos una falla temporal. ¿Te ayudamos a programar tu cita?"
+    );
+
+    res.writeHead(200, {
+      "Content-Type": "text/xml;charset=utf-8",
+      "Content-Length": Buffer.byteLength(fallback),
+    });
     res.end(fallback);
   }
 });
@@ -1446,6 +1524,10 @@ if (req.method === "GET" && req.url === "/test-huli") {
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ Bot Dr. Cid escuchando en puerto ${PORT}`);
   console.log(`✅ Huli: ${huliDisponible() ? "ACTIVO" : "PENDIENTE (modo manual)"}`);
-  console.log(`✅ Horarios: dias=${[...ALLOWED_WEEKDAYS].join(",")} de ${process.env.SLOT_START_HHMM || "15:30"} a ${process.env.SLOT_END_HHMM || "21:30"}`);
-  console.log(`✅ TTL conversaciones: ${CONV_TTL_MS / 3_600_000}h`);
+  console.log(
+    `✅ DIAGNÓSTICO TEMPORAL HULI: filtro de slots desactivado para revisar timezone`
+  );
+  console.log(
+    `✅ Horario esperado configurado: dias=${Array.from(ALLOWED_WEEKDAYS).join(",")} de 15:30 a 21:30`
+  );
 });
