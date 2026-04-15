@@ -32,6 +32,19 @@ const conversaciones = new Map();
 let huliJwt = null;
 let huliJwtExpiry = 0;
 
+// ── Limpieza periódica de conversaciones inactivas ────────────────────────────
+const CONV_EXPIRE_MS = 12 * 60 * 60 * 1000; // 12 horas
+
+setInterval(() => {
+  const cutoff = Date.now() - CONV_EXPIRE_MS;
+  for (const [phone, conv] of conversaciones) {
+    if ((conv.lastActivity || 0) < cutoff) {
+      conversaciones.delete(phone);
+    }
+  }
+  console.log(`[GC] Conversaciones activas: ${conversaciones.size}`);
+}, 60 * 60 * 1000); // cada hora
+
 function normalizeText(text) {
   return String(text || "")
     .trim()
@@ -126,6 +139,13 @@ Si prefieres hablar directamente con el doctor, también me lo puedes decir y se
 }
 
 function getConv(phone) {
+  const existing = conversaciones.get(phone);
+
+  if (existing && Date.now() - (existing.lastActivity || 0) > CONV_EXPIRE_MS) {
+    conversaciones.delete(phone);
+    console.log(`[GC] Conversación expirada para ${phone}, reiniciando.`);
+  }
+
   if (!conversaciones.has(phone)) {
     conversaciones.set(phone, {
       stage: "idle",
@@ -137,9 +157,13 @@ function getConv(phone) {
       manualPreference: "",
       datePreference: null,
       lastIncomingText: "",
+      lastActivity: Date.now(),
     });
   }
-  return conversaciones.get(phone);
+
+  const conv = conversaciones.get(phone);
+  conv.lastActivity = Date.now();
+  return conv;
 }
 
 const MESES = {
@@ -319,12 +343,14 @@ async function huliCreatePatient(patient) {
             {
               type: "MOBILE",
               phoneNumber: Number(phone),
-              country: { id: 188 },
+              country: { id: 484 },
             },
           ]
         : [],
     },
   };
+
+  console.log("huliCreatePatient body:", JSON.stringify(body));
 
   const data = await huliRequest("POST", "/practice/v2/patient-file", body);
   return data.id || data.patientFileId || data.data?.id;
@@ -810,6 +836,43 @@ function cantMakeIt(t) {
   ].some((k) => t.includes(k));
 }
 
+function detectRequestedWeekday(text) {
+  const t = normalizeText(text);
+
+  if (t.includes("lunes")) return "lunes";
+  if (t.includes("martes")) return "martes";
+  if (t.includes("miercoles") || t.includes("miércoles")) return "miércoles";
+  if (t.includes("jueves")) return "jueves";
+  if (t.includes("viernes")) return "viernes";
+  if (t.includes("sabado") || t.includes("sábado")) return "sábado";
+  if (t.includes("domingo")) return "domingo";
+
+  return null;
+}
+
+function isConsultationWeekday(day) {
+  return ["lunes", "miércoles", "viernes"].includes(day);
+}
+
+function buildRequestedWeekdayReply(day) {
+  if (!day) return null;
+
+  if (isConsultationWeekday(day)) {
+    return `Claro 😊
+
+El doctor consulta ${day} a partir de las 3:30 pm, según disponibilidad.
+
+Si gustas, te comparto los horarios más próximos disponibles para que elijas el que mejor te quede.`;
+  }
+
+  return `Claro 😊
+
+El doctor consulta lunes, miércoles y viernes a partir de las 3:30 pm, según disponibilidad.
+
+Para ${day} no tenemos consulta.
+Si gustas, te comparto los horarios más próximos disponibles para que elijas el que mejor te quede.`;
+}
+
 // ── DATOS PACIENTE ────────────────────────────────────────────────────────────
 
 function nextMissingField(state) {
@@ -1015,7 +1078,14 @@ function formatSlots(slots) {
 function detectSlotChoice(msg, cls, slots) {
   if (!slots?.length) return null;
 
-  const t = normalizeText(msg);
+  const raw = String(msg || "").trim();
+  const t = normalizeText(raw)
+    .replace(/²/g, "2")
+    .replace(/¹/g, "1")
+    .replace(/³/g, "3")
+    .replace(/#/g, "")
+    .replace(/opcion/g, "")
+    .replace(/opción/g, "");
 
   if (t === "1" || t.startsWith("1 ") || t.startsWith("el 1") || t.includes("primera") || t.includes("primer")) {
     return slots[0] || null;
@@ -1136,7 +1206,7 @@ Dime cuál te queda mejor y te ayudo a apartarlo.`;
 
 Si gustas, te dejo registrada para que el consultorio te confirme el espacio más próximo.
 
-${buildNextDataQuestion(state)}`;
+${buildNextDataQuestion(state) || ""}`;
       }
     } else {
       slots = await huliGetSlots(6);
@@ -1155,7 +1225,7 @@ ${buildNextDataQuestion(state)}`;
 
 Si gustas, te dejo registrada para que el consultorio te confirme el espacio más próximo.
 
-${buildNextDataQuestion(state)}`;
+${buildNextDataQuestion(state) || ""}`;
     }
 
     state.slots = slots.slice(0, 3);
@@ -1175,7 +1245,7 @@ Puedes responder 1, 2 o 3.`;
 
 Si gustas, te dejo registrada para que el consultorio te confirme el espacio más próximo.
 
-${buildNextDataQuestion(state)}`;
+${buildNextDataQuestion(state) || ""}`;
   }
 }
 
@@ -1273,7 +1343,7 @@ async function agendarCita(state) {
       notifyDoctor("CITA_HULI", state).catch(console.error);
     }
 
-    return `Listo, ya quedaste 😊
+    return `Listo, tu cita quedó registrada 😊
 
 📅 ${slot.date_l10n} a las ${slot.time_l10n}
 👤 ${state.patient.nombre}
@@ -1334,6 +1404,20 @@ Si puedes, cuéntame brevemente cómo te sientes.`;
     return `Claro 😊
 
 Cuéntame qué está pasando o qué te gustaría revisar, y con gusto te apoyo para orientarte mejor.`;
+  }
+
+  if (state.stage === "confirmada") {
+    if (wantsAppointment(msg) || cls?.wants_appointment) {
+      state.stage = "idle";
+      state.flags = { pidioPrecio: false, yaDimosPrecio: false, notificado: false };
+      state.slots = [];
+      state.chosenSlot = null;
+      state.patient.motivo = "";
+    } else {
+      return `Tu cita ya quedó confirmada 😊
+
+Si necesitas cambiar el horario o tienes alguna duda, aquí puedo ayudarte.`;
+    }
   }
 
   if (state.stage === "duda") {
@@ -1421,6 +1505,17 @@ ${buildNextDataQuestion(state) || ""}`;
       return await ofrecerHorarios(state, datePref);
     }
 
+    const requestedDay = detectRequestedWeekday(msg);
+    if (requestedDay) {
+      const dayReply = buildRequestedWeekdayReply(requestedDay);
+      return `${dayReply}
+
+${formatSlots(state.slots)}
+
+Dime cuál te queda mejor y te lo aparto.
+Puedes responder 1, 2 o 3.`;
+    }
+
     if (cantMakeIt(msg) || cls?.cant_make_it) {
       return await ofrecerHorariosAlternativos(state, msg, cls);
     }
@@ -1501,12 +1596,25 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "GET" && req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json;charset=utf-8" });
+      res.end(JSON.stringify({
+        ok: true,
+        huli: huliDisponible(),
+        conversaciones: conversaciones.size,
+        uptime: Math.floor(process.uptime()),
+      }));
+      return;
+    }
+
     if (req.method === "POST" && (req.url === "/whatsapp" || req.url === "/whatsapp/")) {
-      const params = new URLSearchParams(await readBody(req));
+      const body = await readBody(req);
+      const params = new URLSearchParams(body);
       const msg = (params.get("Body") || "").trim();
       const fromPhone = params.get("From") || "desconocido";
+      const messageSid = params.get("MessageSid") || "";
 
-      console.log(`[${new Date().toISOString()}] From:${fromPhone} Msg:${msg}`);
+      console.log(`[${new Date().toISOString()}] From:${fromPhone} Sid:${messageSid} Msg:${msg}`);
 
       const state = getConv(fromPhone);
 
