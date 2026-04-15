@@ -99,15 +99,17 @@ function isGreeting(text) {
 }
 
 function buildWelcomeMessage() {
-  return `👩🏻‍⚕️ Hola. Soy el asistente del Dr. Ricardo Cid Trejo, ginecólogo.
+  return `👩🏻‍⚕️ Hola, soy el asistente del Dr. Ricardo Cid Trejo, ginecólogo.
 
-Gracias por escribirnos. ¿Me podrías compartir tu nombre y en qué te gustaría que te apoyáramos? 🩺✨`;
+Gracias por escribirnos 😊
+¿Me compartes tu nombre y me dices si es por embarazo, chequeo o alguna molestia en particular?`;
 }
 
 function buildDoctorIdentityReply() {
   return `Hola 😊 Soy el asistente del Dr. Ricardo Cid Trejo.
 
-Si gustas, cuéntame qué necesitas y con gusto te apoyo. Si prefieres hablar directamente con el doctor, también me lo puedes decir y se lo notifico.`;
+Con gusto te apoyo por aquí para orientarte y ayudarte a agendar.
+Si prefieres hablar directamente con el doctor, también me lo puedes decir y se lo notifico.`;
 }
 
 function getConv(phone) {
@@ -467,19 +469,30 @@ async function huliGetSlots(days = 6) {
 // ── OPENAI ────────────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `Eres el asistente virtual de WhatsApp del ${CONSULTORIO_NOMBRE}.
-Atiendes con calidez y llevas a las pacientes a agendar cita.
+
+OBJETIVO PRINCIPAL:
+- Convertir pacientes que llegan de redes sociales en citas confirmadas.
+- Guiar la conversación con seguridad, calidez y tono médico profesional.
+- No solo responder; siempre avanzar al siguiente paso.
+- El paciente no decide si agenda, decide qué horario elige.
 
 ESTILO:
-- Saluda siempre
-- Respuestas cortas
+- Mensajes cortos, claros y naturales, estilo WhatsApp.
+- Tono cálido, tranquilo, profesional y seguro.
 - Emojis moderados: 😊 🙂 👍🏻
-- Transmite tranquilidad
+- Nunca sonar robótico ni demasiado vendedor.
 
 REGLAS:
-- NO diagnostiques
-- NO recetes
-- NO digas que eres IA
-- El precio (${CONSULTA_PRECIO} incluye ultrasonido) solo con contexto
+- NO diagnostiques.
+- NO recetes.
+- NO prometas resultados.
+- NO digas que eres IA.
+- NO cierres con "avísame cualquier cosa".
+- SIEMPRE termina con una acción concreta.
+- Cuando pregunten precio, primero explica brevemente qué incluye la consulta y el valor, luego da el costo y después empuja a horarios.
+- Siempre que detectes interés, guía a elegir horario.
+- Si la paciente duda, refuerza tranquilidad, valor y facilidad para agendar.
+- No abras opciones innecesarias; mejor da 1 o 2 caminos concretos.
 
 URGENCIAS:
 - sangrado abundante
@@ -547,6 +560,8 @@ Reglas:
 - date_preference: texto exacto si menciona mes o plazo
 - slot_choice: "1", "2" o "3"
 - patient_dob: DD/MM/YYYY
+- patient_name: solo si claramente dio su nombre
+- patient_reason: solo si claramente dijo motivo de consulta
 Sin explicaciones fuera del JSON.`;
 
   try {
@@ -591,12 +606,19 @@ async function answerMedicalDoubt(state, msg) {
   if (!OPENAI_API_KEY) {
     return `Gracias por explicarme 😊
 
-Para poder orientarte con mayor claridad lo ideal es valorarlo en consulta.
+Para orientarte con más claridad, lo ideal es que el doctor lo valore en consulta.
 
-Si sientes que es urgente o quieres hablar directamente con el doctor, dime y se lo notifico.`;
+Tengo espacios disponibles esta semana.
+Si gustas, te comparto los horarios más próximos.`;
   }
 
-  const prompt = `Eres el asistente virtual del ${CONSULTORIO_NOMBRE}. La paciente tiene una duda o síntomas. Responde en español con tono cálido. Da orientación general sin diagnosticar ni recetar. No alarmes. Invita a consulta. Termina diciendo que si es urgente o quiere hablar con el doctor directamente, lo diga.`;
+  const prompt = `Eres el asistente virtual del ${CONSULTORIO_NOMBRE}. La paciente tiene una duda o síntomas.
+Responde en español con tono cálido, breve y profesional.
+Da orientación general sin diagnosticar ni recetar.
+No alarmes.
+Primero valida lo que siente.
+Luego explica que lo ideal es valorarlo en consulta.
+Termina guiando a agendar, no con una pregunta abierta débil, sino invitando a revisar horarios.`;
 
   try {
     return await callOAI(
@@ -613,9 +635,10 @@ Si sientes que es urgente o quieres hablar directamente con el doctor, dime y se
   } catch {
     return `Gracias por explicarme 😊
 
-Para poder orientarte mejor lo ideal es valorarlo en consulta.
+Para orientarte mejor y revisar bien tu caso, lo ideal es valorarlo en consulta con el doctor.
 
-Si sientes que es urgente, dime y le notifico al doctor directamente.`;
+Tengo algunos espacios disponibles esta semana.
+Si gustas, te comparto los horarios más próximos.`;
   }
 }
 
@@ -675,14 +698,24 @@ function wantsAppointment(t) {
     "como agendo",
     "quiero ir a revision",
     "me puede ver",
+    "quiero consulta",
+    "quiero valoracion",
+    "quiero valoración",
   ].some((k) => t.includes(k));
 }
 
 function wantsPrice(t) {
   t = normalizeText(t);
-  return ["precio", "cuanto cuesta", "costo", "cuanto sale", "cuanto cobra", "que precio tiene"].some((k) =>
-    t.includes(k)
-  );
+  return [
+    "precio",
+    "cuanto cuesta",
+    "costo",
+    "cuanto sale",
+    "cuanto cobra",
+    "que precio tiene",
+    "informes",
+    "info",
+  ].some((k) => t.includes(k));
 }
 
 function wantsInfo(t) {
@@ -694,7 +727,6 @@ function wantsInfo(t) {
     "quisiera informacion",
     "quiero preguntar",
     "tengo una pregunta",
-    "informes",
     "me puede orientar",
     "tengo sintomas",
     "tengo molestia",
@@ -746,8 +778,11 @@ function cantMakeIt(t) {
     "diferente",
     "ninguno",
     "mas tarde",
+    "más tarde",
     "mas temprano",
+    "más temprano",
     "otro dia",
+    "otro día",
     "otra fecha",
   ].some((k) => t.includes(k));
 }
@@ -840,22 +875,27 @@ function extractData(state, text, fromPhone) {
   const motivoKw = [
     "embarazo",
     "revision",
+    "revisión",
     "ultrasonido",
     "dolor",
     "sangrado",
     "infeccion",
+    "infección",
     "planificacion",
+    "planificación",
     "quiste",
     "mioma",
     "papanicolaou",
     "pap",
     "menstruacion",
+    "menstruación",
     "regla",
     "colposcop",
     "chequeo",
     "general",
     "flujo",
     "comezon",
+    "comezón",
     "ardor",
   ];
 
@@ -943,6 +983,13 @@ function formatSlots(slots) {
     .join("\n");
 }
 
+function getTwoBestSlotsText(slots) {
+  const top = (slots || []).slice(0, 2);
+  if (!top.length) return "";
+  if (top.length === 1) return `${top[0].date_l10n} a las ${top[0].time_l10n}`;
+  return `${top[0].date_l10n} a las ${top[0].time_l10n} o ${top[1].date_l10n} a las ${top[1].time_l10n}`;
+}
+
 function detectSlotChoice(msg, cls, slots) {
   if (!slots?.length) return null;
 
@@ -987,6 +1034,10 @@ function detectSlotChoice(msg, cls, slots) {
       `a las ${hour12} ${ampm}`,
       `a las ${hour12}:${minute}`,
       `a las ${hour12}:${minute} ${ampm}`,
+      `el de las ${hour12}`,
+      `el de las ${hour12} ${ampm}`,
+      `el de las ${hour12}:${minute}`,
+      `el de las ${hour12}:${minute} ${ampm}`,
       l10n,
       dateText,
       `${dateText} a las ${hour12}`,
@@ -1009,7 +1060,7 @@ async function pedirDatosYEsperarManual(state) {
     state.stage = "datos_manual";
     return `Con mucho gusto 😊
 
-Para poder agendarte necesito algunos datos.
+Para dejarte registrada necesito algunos datos.
 ${q}`;
   }
   return await confirmarEsperaManual(state);
@@ -1025,7 +1076,7 @@ async function confirmarEsperaManual(state) {
 
 En breve el consultorio te contactará para confirmarte tu horario.
 
-Cualquier duda, aquí me quedo al pendiente 🙂`;
+Cualquier duda, aquí seguimos al pendiente 🙂`;
 }
 
 async function ofrecerHorarios(state, datePreference = null) {
@@ -1050,12 +1101,12 @@ async function ofrecerHorarios(state, datePreference = null) {
 
         if (fallback.length) {
           state.slots = fallback.slice(0, 3);
-          return `Para ${datePreference.text} no tengo espacios disponibles aún 😊
+          return `Para ${datePreference.text} todavía no me aparecen espacios disponibles 😊
 
 Lo más próximo que tengo es:
 ${formatSlots(state.slots)}
 
-¿Cuál te queda mejor? (responde 1, 2 o 3)`;
+Dime cuál te queda mejor y te ayudo a apartarlo.`;
         }
 
         state.stage = "datos_manual";
@@ -1093,7 +1144,8 @@ ${buildNextDataQuestion(state)}`;
     return `${intro}
 ${formatSlots(state.slots)}
 
-¿Cuál te queda mejor? (responde 1, 2 o 3)`;
+Dime cuál te queda mejor y te lo aparto.
+Puedes responder 1, 2 o 3.`;
   } catch (e) {
     console.error("❌ Huli public slots error:", e.message);
     state.stage = "datos_manual";
@@ -1135,10 +1187,10 @@ async function ofrecerHorariosAlternativos(state, msg, cls) {
 
     if (rest.length >= 2) {
       state.slots = rest.slice(0, 3);
-      return `Claro 😊 También tengo:
+      return `Claro 😊 También tengo estas opciones:
 ${formatSlots(state.slots)}
 
-¿Cuál te queda mejor? (responde 1, 2 o 3)`;
+Dime cuál te funciona mejor y te lo aparto.`;
     }
 
     allSlots = await huliGetSlotsInRange(new Date(), (() => {
@@ -1154,7 +1206,7 @@ ${formatSlots(state.slots)}
       return `Claro 😊 Un poco más adelante tengo:
 ${formatSlots(state.slots)}
 
-¿Cuál te queda mejor? (responde 1, 2 o 3)`;
+Dime cuál te queda mejor y avanzamos con el registro.`;
     }
 
     state.stage = "datos_manual";
@@ -1168,7 +1220,9 @@ ${formatSlots(state.slots)}
 
 async function ofrecerPrecioYHorarios(state, datePreference = null) {
   const slotsMsg = await ofrecerHorarios(state, datePreference);
-  return `La consulta incluye valoración completa y ultrasonido 😊
+  return `Claro 😊
+
+La consulta incluye valoración completa y ultrasonido para que el doctor pueda revisar tu caso con mayor claridad.
 
 El costo es ${CONSULTA_PRECIO}.
 
@@ -1197,15 +1251,14 @@ async function agendarCita(state) {
       notifyDoctor("CITA_HULI", state).catch(console.error);
     }
 
-    return `Listo, ya quedaste 🙂
+    return `Listo, ya quedaste 😊
 
 📅 ${slot.date_l10n} a las ${slot.time_l10n}
 👤 ${state.patient.nombre}
 📋 ${state.patient.motivo}
 
-Te llegará un mensaje de confirmación como recordatorio, lo contestas por favor para asegurarte el espacio.
-
-Cualquier duda, aquí me quedo al pendiente 😊`;
+Te llegará un mensaje de confirmación como recordatorio.
+Por favor respóndelo para asegurar tu espacio.`;
   } catch (e) {
     console.error("❌ Error agendando en Huli:", e.message);
 
@@ -1216,9 +1269,7 @@ Cualquier duda, aquí me quedo al pendiente 😊`;
 
     return `Listo 😊 Ya tenemos tus datos registrados.
 
-En breve el consultorio te contactará para confirmarte tu horario exacto.
-
-Cualquier duda, aquí me quedo al pendiente 🙂`;
+En breve el consultorio te contactará para confirmarte tu horario exacto.`;
   }
 }
 
@@ -1258,9 +1309,9 @@ Si puedes, cuéntame brevemente cómo te sientes.`;
 
   if (state.stage === "idle" && (wantsInfo(msg) || cls?.wants_info)) {
     state.stage = "duda";
-    return `Claro 😊 Soy el asistente del Dr. Ricardo Cid Trejo.
+    return `Claro 😊
 
-Cuéntame qué está pasando o qué síntomas tienes, y con gusto te apoyo.`;
+Cuéntame qué está pasando o qué te gustaría revisar, y con gusto te apoyo para orientarte mejor.`;
   }
 
   if (state.stage === "duda") {
@@ -1269,7 +1320,7 @@ Cuéntame qué está pasando o qué síntomas tienes, y con gusto te apoyo.`;
         state.stage = "motivo";
         return `Claro, con gusto te ayudo a agendar 😊
 
-¿Me puedes decir brevemente el motivo de la consulta?`;
+¿Me dices brevemente el motivo de la consulta?`;
       }
       state.stage = "horario";
       return await ofrecerHorarios(state, state.datePreference || null);
@@ -1277,11 +1328,8 @@ Cuéntame qué está pasando o qué síntomas tienes, y con gusto te apoyo.`;
 
     if (wantsPrice(msg) || cls?.wants_price) {
       state.flags.yaDimosPrecio = true;
-      return `Claro 😊 La consulta incluye valoración completa y ultrasonido.
-
-El costo es ${CONSULTA_PRECIO}.
-
-Si gustas, también te puedo ayudar a agendar tu cita.`;
+      state.stage = "horario";
+      return await ofrecerPrecioYHorarios(state, state.datePreference || null);
     }
 
     if (isGreeting(msg)) {
@@ -1292,15 +1340,15 @@ Si gustas, también te puedo ayudar a agendar tu cita.`;
   }
 
   if (state.stage === "espera_confirmacion") {
-    return `Ya tenemos tus datos y el consultorio te contactará pronto para confirmar tu horario 😊
-
-Cualquier duda, aquí me quedo al pendiente.`;
+    return `Ya tenemos tus datos y el consultorio te contactará pronto para confirmar tu horario 😊`;
   }
 
   if (state.stage === "datos_manual") {
     if (wantsPrice(msg) || cls?.wants_price) {
       state.flags.yaDimosPrecio = true;
-      return `Claro 😊 La consulta incluye valoración completa y ultrasonido.
+      return `Claro 😊
+
+La consulta incluye valoración completa y ultrasonido.
 
 El costo es ${CONSULTA_PRECIO}.
 
@@ -1315,9 +1363,9 @@ ${buildNextDataQuestion(state) || ""}`;
   if ((wantsPrice(msg) || cls?.wants_price) && !state.flags.pidioPrecio && !state.patient.motivo) {
     state.flags.pidioPrecio = true;
     state.stage = "precio_q";
-    return `Hola 😊 con gusto te ayudo.
+    return `Claro 😊 con gusto te apoyo.
 
-¿Es para revisión general, embarazo o traes alguna molestia en particular?`;
+¿Es para revisión general, embarazo, ultrasonido o traes alguna molestia en particular?`;
   }
 
   if ((wantsPrice(msg) || cls?.wants_price) && !state.flags.yaDimosPrecio && state.patient.motivo) {
@@ -1326,7 +1374,7 @@ ${buildNextDataQuestion(state) || ""}`;
     return await ofrecerPrecioYHorarios(state, state.datePreference || null);
   }
 
-  if (state.stage === "precio_q" && msg.trim().length > 3 && !isGreeting(msg)) {
+  if (state.stage === "precio_q" && msg.trim().length > 2 && !isGreeting(msg)) {
     if (!state.patient.motivo) state.patient.motivo = msg.trim().slice(0, 200);
     state.flags.yaDimosPrecio = true;
     state.stage = "horario";
@@ -1334,7 +1382,7 @@ ${buildNextDataQuestion(state) || ""}`;
   }
 
   if (state.stage === "motivo") {
-    if (!isGreeting(msg) && msg.trim().length > 3) {
+    if (!isGreeting(msg) && msg.trim().length > 2) {
       if (!state.patient.motivo) state.patient.motivo = msg.trim().slice(0, 200);
       state.stage = "horario";
       return await ofrecerHorarios(state, state.datePreference || null);
@@ -1362,7 +1410,7 @@ ${buildNextDataQuestion(state) || ""}`;
       const next = buildNextDataQuestion(state);
       if (next) {
         state.stage = "datos";
-        return `Perfecto, reservamos el ${chosen.date_l10n} a las ${chosen.time_l10n} 😊
+        return `Perfecto, te aparto el ${chosen.date_l10n} a las ${chosen.time_l10n} 😊
 
 ${next}`;
       }
@@ -1385,6 +1433,12 @@ ${formatSlots(state.slots)}
 Respóndeme 1, 2 o 3, o escríbeme la hora que prefieras.`;
   }
 
+  if (state.stage === "datos") {
+    const q = buildNextDataQuestion(state);
+    if (q) return q;
+    return await agendarCita(state);
+  }
+
   if (wantsAppointment(msg) || cls?.wants_appointment) {
     if (datePref && !state.patient.motivo) {
       state.stage = "motivo";
@@ -1402,12 +1456,6 @@ Respóndeme 1, 2 o 3, o escríbeme la hora que prefieras.`;
 
     state.stage = "horario";
     return await ofrecerHorarios(state, state.datePreference || null);
-  }
-
-  if (state.stage === "datos") {
-    const q = buildNextDataQuestion(state);
-    if (q) return q;
-    return await agendarCita(state);
   }
 
   if (!OPENAI_API_KEY) {
@@ -1475,7 +1523,7 @@ const server = createServer(async (req, res) => {
     res.end("Not found");
   } catch (err) {
     console.error("SERVER ERROR:", err);
-    const fallback = twiml("Hola 😊 Tuvimos una falla temporal. ¿Te ayudamos a programar tu cita?");
+    const fallback = twiml("Hola 😊 Tuvimos una falla temporal. ¿Te ayudo a revisar los horarios disponibles?");
     res.writeHead(200, {
       "Content-Type": "text/xml;charset=utf-8",
       "Content-Length": Buffer.byteLength(fallback),
