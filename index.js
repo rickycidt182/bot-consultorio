@@ -964,11 +964,38 @@ function detectSlotChoice(msg, cls, slots) {
 
   for (const slot of slots) {
     const hhmm = slot.time.slice(0, 5);
-    if (
-      t.includes(hhmm) ||
-      t.includes(normalizeText(slot.time_l10n)) ||
-      t.includes(normalizeText(slot.date_l10n))
-    ) {
+    const minute = slot.time.slice(3, 5);
+    const l10n = normalizeText(slot.time_l10n);
+    const dateText = normalizeText(slot.date_l10n);
+
+    const hour12 = (() => {
+      const h24 = Number(slot.time.slice(0, 2));
+      if (h24 === 0) return 12;
+      if (h24 > 12) return h24 - 12;
+      return h24;
+    })();
+
+    const ampm = Number(slot.time.slice(0, 2)) >= 12 ? "pm" : "am";
+
+    const naturalVariants = [
+      hhmm,
+      `${hour12}`,
+      `${hour12}:${minute}`,
+      `${hour12} ${ampm}`,
+      `${hour12}:${minute} ${ampm}`,
+      `a las ${hour12}`,
+      `a las ${hour12} ${ampm}`,
+      `a las ${hour12}:${minute}`,
+      `a las ${hour12}:${minute} ${ampm}`,
+      l10n,
+      dateText,
+      `${dateText} a las ${hour12}`,
+      `${dateText} a las ${hour12} ${ampm}`,
+      `${dateText} a las ${hour12}:${minute}`,
+      `${dateText} a las ${hour12}:${minute} ${ampm}`,
+    ];
+
+    if (naturalVariants.some((v) => v && t.includes(normalizeText(v)))) {
       return slot;
     }
   }
@@ -1306,25 +1333,6 @@ ${buildNextDataQuestion(state) || ""}`;
     return await ofrecerPrecioYHorarios(state, state.datePreference || null);
   }
 
-  if (wantsAppointment(msg) || cls?.wants_appointment) {
-    if (datePref && !state.patient.motivo) {
-      state.stage = "motivo";
-      return `Claro, con gusto te ayudo a agendar para ${datePref.text} 😊
-
-¿Me puedes decir brevemente el motivo de la consulta?`;
-    }
-
-    if (!state.patient.motivo) {
-      state.stage = "motivo";
-      return `Claro, con gusto te ayudo a agendar 😊
-
-¿Me puedes decir brevemente el motivo de la consulta?`;
-    }
-
-    state.stage = "horario";
-    return await ofrecerHorarios(state, state.datePreference || null);
-  }
-
   if (state.stage === "motivo") {
     if (!isGreeting(msg) && msg.trim().length > 3) {
       if (!state.patient.motivo) state.patient.motivo = msg.trim().slice(0, 200);
@@ -1350,6 +1358,7 @@ ${buildNextDataQuestion(state) || ""}`;
     const chosen = detectSlotChoice(msg, cls, state.slots);
     if (chosen) {
       state.chosenSlot = chosen;
+
       const next = buildNextDataQuestion(state);
       if (next) {
         state.stage = "datos";
@@ -1357,11 +1366,42 @@ ${buildNextDataQuestion(state) || ""}`;
 
 ${next}`;
       }
+
       return await agendarCita(state);
     }
 
+    if (
+      ["si", "sí", "ok", "va", "si esta bien", "sí está bien", "esta bien", "está bien"].includes(normalizeText(msg))
+    ) {
+      return `Perfecto 😊 Solo dime cuál horario te queda mejor:
+${formatSlots(state.slots)}
+
+Respóndeme 1, 2 o 3.`;
+    }
+
     return `Con gusto 😊 Solo confirma cuál horario te queda mejor:
-${formatSlots(state.slots)}`;
+${formatSlots(state.slots)}
+
+Respóndeme 1, 2 o 3, o escríbeme la hora que prefieras.`;
+  }
+
+  if (wantsAppointment(msg) || cls?.wants_appointment) {
+    if (datePref && !state.patient.motivo) {
+      state.stage = "motivo";
+      return `Claro, con gusto te ayudo a agendar para ${datePref.text} 😊
+
+¿Me puedes decir brevemente el motivo de la consulta?`;
+    }
+
+    if (!state.patient.motivo) {
+      state.stage = "motivo";
+      return `Claro, con gusto te ayudo a agendar 😊
+
+¿Me puedes decir brevemente el motivo de la consulta?`;
+    }
+
+    state.stage = "horario";
+    return await ofrecerHorarios(state, state.datePreference || null);
   }
 
   if (state.stage === "datos") {
