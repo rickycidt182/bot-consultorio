@@ -98,11 +98,24 @@ function isGreeting(text) {
   ].includes(t);
 }
 
-function buildWelcomeMessage() {
-  return `👩🏻‍⚕️ Hola, soy el asistente del Dr. Ricardo Cid Trejo, ginecólogo.
+function isJustGreeting(text) {
+  const t = normalizeText(text);
+  return [
+    "hola",
+    "buenas",
+    "buenas tardes",
+    "buen dia",
+    "buenos dias",
+    "buenas noches",
+  ].includes(t);
+}
 
-Gracias por escribirnos 😊
-¿Me compartes tu nombre y me dices si es por embarazo, chequeo o alguna molestia en particular?`;
+function buildWelcomeMessage() {
+  return `Hola 😊
+
+Con gusto te apoyo.
+
+¿Es para embarazo, chequeo, ultrasonido o alguna molestia en particular?`;
 }
 
 function buildDoctorIdentityReply() {
@@ -279,27 +292,37 @@ async function huliFindPatient(phone) {
 }
 
 async function huliCreatePatient(patient) {
-  const [firstName, ...rest] = (patient.nombre || "Sin nombre").split(" ");
+  const [firstName, ...rest] = (patient.nombre || "Sin nombre").trim().split(/\s+/);
   const lastName = rest.join(" ") || "-";
   const phone = String(patient.telefono || "").replace(/\D/g, "").slice(-10);
 
-  let dob = null;
+  let birthdate = null;
   const m = String(patient.fechaNacimiento || "").match(
     /(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/
   );
+
   if (m) {
-    const y = m[3].length === 2 ? `20${m[3]}` : m[3];
-    dob = `${y}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+    const year = m[3].length === 2 ? `20${m[3]}` : m[3];
+    birthdate = `${year}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
   }
 
   const body = {
-    personal_data: {
-      first_name: firstName,
-      last_name: lastName,
-      ...(dob ? { date_of_birth: dob } : {}),
+    personalData: {
+      firstName,
+      lastName,
+      ...(birthdate ? { birthdate } : {}),
     },
     contact: {
-      phones: [{ type: "MOBILE", phone_number: phone, id_country: 484 }],
+      sendNotifications: true,
+      phones: phone
+        ? [
+            {
+              type: "MOBILE",
+              phoneNumber: Number(phone),
+              country: { id: 188 },
+            },
+          ]
+        : [],
     },
   };
 
@@ -968,7 +991,13 @@ Ya le avisamos que la contactarán.`,
       }
     );
 
-    console.log(resp.ok ? `✅ Doctor notificado: ${type}` : `❌ Error Twilio: ${await resp.text()}`);
+    if (!resp.ok) {
+      const errText = await resp.text();
+      console.error(`❌ Error Twilio: ${errText}`);
+      return;
+    }
+
+    console.log(`✅ Doctor notificado: ${type}`);
   } catch (e) {
     console.error("notifyDoctor error:", e);
   }
@@ -981,13 +1010,6 @@ function formatSlots(slots) {
     .slice(0, 3)
     .map((s, i) => `${i + 1}. ${s.date_l10n} a las ${s.time_l10n}`)
     .join("\n");
-}
-
-function getTwoBestSlotsText(slots) {
-  const top = (slots || []).slice(0, 2);
-  if (!top.length) return "";
-  if (top.length === 1) return `${top[0].date_l10n} a las ${top[0].time_l10n}`;
-  return `${top[0].date_l10n} a las ${top[0].time_l10n} o ${top[1].date_l10n} a las ${top[1].time_l10n}`;
 }
 
 function detectSlotChoice(msg, cls, slots) {
@@ -1303,7 +1325,7 @@ Si puedes, cuéntame brevemente cómo te sientes.`;
     return buildDoctorIdentityReply();
   }
 
-  if (state.stage === "idle" && isGreeting(msg)) {
+  if (state.stage === "idle" && isJustGreeting(msg)) {
     return buildWelcomeMessage();
   }
 
