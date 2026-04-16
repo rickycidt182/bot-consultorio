@@ -24,9 +24,10 @@ const HULI_BASE = "https://api.huli.io";
 const huliDisponible = () =>
   !!(HULI_API_KEY && HULI_ORG_ID && HULI_DOCTOR_ID && HULI_CLINIC_ID);
 
-const ALLOWED_WEEKDAYS = new Set([1, 3, 5]);
-const MIN_SLOT_MINUTES = 15 * 60 + 30;
-const MAX_SLOT_MINUTES = 21 * 60 + 30;
+const ALLOWED_WEEKDAYS = new Set([1, 3, 5]); // lunes, miércoles, viernes
+const MIN_SLOT_MINUTES = 15 * 60 + 30; // 15:30
+const MAX_SLOT_MINUTES = 21 * 60 + 30; // 21:30
+const FOLLOWUP_DELAY_MS = 30 * 60 * 1000; // 30 min
 
 const conversaciones = new Map();
 let huliJwt = null;
@@ -39,11 +40,14 @@ setInterval(() => {
   const cutoff = Date.now() - CONV_EXPIRE_MS;
   for (const [phone, conv] of conversaciones) {
     if ((conv.lastActivity || 0) < cutoff) {
+      if (conv.followUpTimer) clearTimeout(conv.followUpTimer);
       conversaciones.delete(phone);
     }
   }
   console.log(`[GC] Conversaciones activas: ${conversaciones.size}`);
-}, 60 * 60 * 1000); // cada hora
+}, 60 * 60 * 1000);
+
+// ── Utils ─────────────────────────────────────────────────────────────────────
 
 function normalizeText(text) {
   return String(text || "")
@@ -89,6 +93,85 @@ async function readBody(req) {
   });
 }
 
+// ── Saludos / intro ───────────────────────────────────────────────────────────
+
+function getBestGreetingName(state) {
+  if (state.patient?.nombre) return state.patient.nombre.split(/\s+/)[0];
+  if (state.knownPatientName) return state.knownPatientName.split(/\s+/)[0];
+  if (state.source?.profileName) return state.source.profileName.split(/\s+/)[0];
+  return "";
+}
+
+function buildIntroPrefix(state) {
+  const firstName = getBestGreetingName(state);
+
+  if (state?.source?.isCtwaAd) {
+    if (firstName) {
+      return `Hola ${firstName} 😊 Soy el asistente del Dr. Ricardo Cid Trejo.
+
+Gracias por escribirnos.
+Con gusto te apoyo por aquí.
+
+`;
+    }
+
+    return `Hola 😊 Soy el asistente del Dr. Ricardo Cid Trejo.
+
+Gracias por escribirnos.
+Con gusto te apoyo por aquí.
+
+`;
+  }
+
+  if (firstName) {
+    return `Hola ${firstName} 😊 Soy el asistente del Dr. Ricardo Cid Trejo.
+
+Con gusto te apoyo por aquí.
+
+`;
+  }
+
+  return `Hola 😊 Soy el asistente del Dr. Ricardo Cid Trejo.
+
+Con gusto te apoyo por aquí.
+
+`;
+}
+
+function buildWelcomeMessage(state = null) {
+  const intro = state
+    ? buildIntroPrefix(state)
+    : `Hola 😊 Soy el asistente del Dr. Ricardo Cid Trejo.
+
+Con gusto te apoyo por aquí.
+
+`;
+
+  const leadLine = state?.source?.isCtwaAd
+    ? "Para ayudarte más rápido, puedes elegir una opción:"
+    : "¿Cómo te puedo ayudar? Puedes elegir una opción:";
+
+  return `${intro}${leadLine}
+1️⃣ Agendar una cita
+2️⃣ Información de consulta
+3️⃣ Tengo una duda o molestia
+4️⃣ Es una urgencia
+5️⃣ Hablar con el doctor
+
+Puedes responder solo con el número o escribirme directamente lo que necesitas.`;
+}
+
+function buildDoctorIdentityReply(state = null) {
+  const intro = state
+    ? buildIntroPrefix(state)
+    : `Hola 😊 Soy el asistente del Dr. Ricardo Cid Trejo.
+
+`;
+
+  return `${intro}Con gusto te apoyo por aquí para orientarte y ayudarte a agendar.
+Si prefieres hablar directamente con el doctor, también me lo puedes decir y se lo notifico.`;
+}
+
 function isGreeting(text) {
   const t = normalizeText(text);
   return [
@@ -120,28 +203,20 @@ function isJustGreeting(text) {
     "buen dia",
     "buenos dias",
     "buenas noches",
+    "hello",
+    "holi",
+    "que tal",
+    "qué tal",
   ].includes(t);
 }
 
-function buildWelcomeMessage() {
-  return `Hola 😊
-
-Con gusto te apoyo.
-
-¿Es para embarazo, chequeo, ultrasonido o alguna molestia en particular?`;
-}
-
-function buildDoctorIdentityReply() {
-  return `Hola 😊 Soy el asistente del Dr. Ricardo Cid Trejo.
-
-Con gusto te apoyo por aquí para orientarte y ayudarte a agendar.
-Si prefieres hablar directamente con el doctor, también me lo puedes decir y se lo notifico.`;
-}
+// ── Estado de conversación ────────────────────────────────────────────────────
 
 function getConv(phone) {
   const existing = conversaciones.get(phone);
 
   if (existing && Date.now() - (existing.lastActivity || 0) > CONV_EXPIRE_MS) {
+    if (existing.followUpTimer) clearTimeout(existing.followUpTimer);
     conversaciones.delete(phone);
     console.log(`[GC] Conversación expirada para ${phone}, reiniciando.`);
   }
@@ -158,6 +233,19 @@ function getConv(phone) {
       datePreference: null,
       lastIncomingText: "",
       lastActivity: Date.now(),
+      followUpTimer: null,
+      followUpSent: false,
+      pendingTriage: null,
+      isNew: true,
+      knownPatientName: "",
+      source: {
+        isCtwaAd: false,
+        referralHeadline: "",
+        referralSourceId: "",
+        referralSourceUrl: "",
+        referralCtwaClid: "",
+        profileName: "",
+      },
     });
   }
 
@@ -165,6 +253,8 @@ function getConv(phone) {
   conv.lastActivity = Date.now();
   return conv;
 }
+
+// ── Fechas ────────────────────────────────────────────────────────────────────
 
 const MESES = {
   enero: 1,
@@ -312,6 +402,44 @@ async function huliFindPatient(phone) {
     return null;
   } catch {
     return null;
+  }
+}
+
+async function enrichKnownPatientName(state, fromPhone) {
+  if (!huliDisponible()) return;
+  if (state.knownPatientName) return;
+
+  try {
+    const clean = String(fromPhone || "").replace(/\D/g, "");
+    const local = clean.slice(-10);
+
+    for (const query of [local, clean]) {
+      if (!query) continue;
+
+      const data = await huliRequest(
+        "GET",
+        `/practice/v2/patient-file?query=${query}&limit=1`
+      );
+
+      const first = data?.patientFiles?.[0];
+      if (!first) continue;
+
+      const name =
+        first?.personalData?.fullName ||
+        [first?.personalData?.firstName, first?.personalData?.lastName]
+          .filter(Boolean)
+          .join(" ")
+          .trim() ||
+        first?.name ||
+        "";
+
+      if (name) {
+        state.knownPatientName = name;
+        return;
+      }
+    }
+  } catch (e) {
+    console.error("enrichKnownPatientName error:", e.message);
   }
 }
 
@@ -499,7 +627,9 @@ async function huliGetSlotsInRange(from, to) {
   }
 
   console.log(`Huli public total slots útiles=${allSlots.length}`);
-  if (allSlots.length) console.log("primeros 3:", JSON.stringify(allSlots.slice(0, 3)));
+  if (allSlots.length) {
+    console.log("primeros 3:", JSON.stringify(allSlots.slice(0, 3)));
+  }
 
   return allSlots;
 }
@@ -648,7 +778,10 @@ async function writerReply(state, msg) {
     state.messages.splice(0, state.messages.length - 16);
   }
 
-  return reply || "Claro 😊 Soy el asistente del Dr. Ricardo Cid Trejo. ¿En qué te puedo apoyar?";
+  return (
+    reply ||
+    "Claro 😊 Soy el asistente del Dr. Ricardo Cid Trejo. ¿En qué te puedo apoyar?"
+  );
 }
 
 async function answerMedicalDoubt(state, msg) {
@@ -691,22 +824,25 @@ Si gustas, te comparto los horarios más próximos.`;
   }
 }
 
-// ── DETECTORES ────────────────────────────────────────────────────────────────
+// ── Detectores ────────────────────────────────────────────────────────────────
 
 function isPriority(t) {
   t = normalizeText(t);
   return [
     "parto",
     "cesarea",
+    "cesárea",
     "urgencia",
     "urgente",
     "sangrado abundante",
     "mucho sangrado",
+    "sangrado fuerte",
     "dolor intenso",
     "dolor fuerte",
     "dolor insoportable",
     "fiebre",
     "embarazo ectopico",
+    "embarazo ectópico",
     "emergencia",
     "no se mueve mi bebe",
     "ya no se mueve mi bebe",
@@ -721,6 +857,10 @@ function isPriority(t) {
     "ya no lo siento",
     "no siento que se mueva mi bebe",
     "casi no se mueve mi bebe",
+    "coagulos",
+    "coágulos",
+    "mareo intenso",
+    "desmayo",
   ].some((k) => t.includes(k));
 }
 
@@ -734,18 +874,25 @@ function wantsAppointment(t) {
     "sacar una cita",
     "disponible",
     "que dia tiene",
+    "qué dia tiene",
     "tiene lugar",
     "puedo ir",
     "cuando puede",
+    "cuándo puede",
     "necesito cita",
     "quisiera cita",
     "quiero agendar",
     "tiene horarios",
     "que horarios tiene",
+    "qué horarios tiene",
     "cuando tiene citas",
+    "cuándo tiene citas",
     "como saco cita",
+    "cómo saco cita",
     "como agendo",
+    "cómo agendo",
     "quiero ir a revision",
+    "quiero ir a revisión",
     "me puede ver",
     "quiero consulta",
     "quiero valoracion",
@@ -758,12 +905,20 @@ function wantsPrice(t) {
   return [
     "precio",
     "cuanto cuesta",
+    "cuánto cuesta",
+    "cuanto cuesta la consulta",
+    "cuánto cuesta la consulta",
     "costo",
     "cuanto sale",
+    "cuánto sale",
     "cuanto cobra",
+    "cuánto cobra",
     "que precio tiene",
+    "qué precio tiene",
     "informes",
     "info",
+    "informacion de consulta",
+    "información de consulta",
   ].some((k) => t.includes(k));
 }
 
@@ -773,16 +928,20 @@ function wantsInfo(t) {
     "tengo una duda",
     "una duda",
     "quiero informacion",
+    "quiero información",
     "quisiera informacion",
+    "quisiera información",
     "quiero preguntar",
     "tengo una pregunta",
     "me puede orientar",
     "tengo sintomas",
+    "tengo síntomas",
     "tengo molestia",
     "tengo flujo",
     "tengo dolor",
     "tengo sangrado",
     "duda de",
+    "tengo una molestia",
   ].some((k) => t.includes(k));
 }
 
@@ -873,7 +1032,159 @@ Para ${day} no tenemos consulta.
 Si gustas, te comparto los horarios más próximos disponibles para que elijas el que mejor te quede.`;
 }
 
-// ── DATOS PACIENTE ────────────────────────────────────────────────────────────
+function detectWelcomeMenuOption(text) {
+  const t = normalizeText(String(text || "").trim())
+    .replace(/^opcion\s+/g, "")
+    .replace(/^opción\s+/g, "")
+    .replace(/[️⃣]/g, "");
+
+  if (
+    t === "1" ||
+    t === "1." ||
+    t === "1)" ||
+    t.includes("agendar una cita") ||
+    t.includes("agendar cita") ||
+    t.includes("quiero cita") ||
+    t.includes("quiero agendar")
+  ) {
+    return 1;
+  }
+
+  if (
+    t === "2" ||
+    t === "2." ||
+    t === "2)" ||
+    t.includes("informacion de consulta") ||
+    t.includes("información de consulta") ||
+    t === "informacion" ||
+    t === "información" ||
+    t === "precio" ||
+    t === "costo"
+  ) {
+    return 2;
+  }
+
+  if (
+    t === "3" ||
+    t === "3." ||
+    t === "3)" ||
+    t.includes("tengo una duda") ||
+    t === "duda" ||
+    t.includes("molestia") ||
+    t.includes("sintoma") ||
+    t.includes("síntoma")
+  ) {
+    return 3;
+  }
+
+  if (
+    t === "4" ||
+    t === "4." ||
+    t === "4)" ||
+    t.includes("urgencia") ||
+    t.includes("urgente") ||
+    t.includes("emergencia")
+  ) {
+    return 4;
+  }
+
+  if (
+    t === "5" ||
+    t === "5." ||
+    t === "5)" ||
+    t.includes("hablar con el doctor") ||
+    t.includes("hablar con doctor") ||
+    t === "doctor" ||
+    t === "dr"
+  ) {
+    return 5;
+  }
+
+  return null;
+}
+
+// ── Sangrado / triage ─────────────────────────────────────────────────────────
+
+function mentionsBleeding(text) {
+  const t = normalizeText(text);
+  return ["sangrado", "sangrar", "manchado", "manchon", "manchón", "spotting"].some((k) =>
+    t.includes(k)
+  );
+}
+
+function detectBleedingSeverity(text) {
+  const t = normalizeText(text);
+
+  const abundantSignals = [
+    "abundante",
+    "mucho",
+    "bastante",
+    "fuerte",
+    "intenso",
+    "empapo",
+    "empapa",
+    "toalla",
+    "coagulo",
+    "coágulo",
+    "coagulos",
+    "coágulos",
+    "chorro",
+    "rojo brillante",
+    "dolor fuerte",
+    "dolor intenso",
+    "mucho dolor",
+    "mareo",
+    "me mareo",
+    "debilidad",
+    "fiebre",
+  ];
+
+  const lightSignals = [
+    "manchado",
+    "manchon",
+    "manchón",
+    "leve",
+    "poquito",
+    "poco",
+    "poquita",
+    "solo al limpiarme",
+    "solo cuando me limpio",
+    "unas gotas",
+    "poquitas gotas",
+    "muy poco",
+  ];
+
+  if (
+    t === "1" ||
+    t === "1." ||
+    t === "1)" ||
+    abundantSignals.some((k) => t.includes(k))
+  ) {
+    return "abundante";
+  }
+
+  if (t === "2" || t === "2." || t === "2)" || lightSignals.some((k) => t.includes(k))) {
+    return "leve";
+  }
+
+  return null;
+}
+
+function shouldAskBleedingTriage(state, msg) {
+  if (!mentionsBleeding(msg)) return false;
+
+  if (
+    ["prioridad", "confirmada", "espera_confirmacion", "triage_sangrado"].includes(
+      state.stage
+    )
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+// ── Datos paciente ────────────────────────────────────────────────────────────
 
 function nextMissingField(state) {
   if (!state.patient.nombre) return "nombre";
@@ -885,8 +1196,9 @@ function nextMissingField(state) {
 function buildNextDataQuestion(state) {
   const next = nextMissingField(state);
   if (next === "nombre") return "Para dejarte registrada, ¿me compartes tu nombre completo?";
-  if (next === "fechaNacimiento")
+  if (next === "fechaNacimiento") {
     return "Gracias 😊 ¿Me compartes tu fecha de nacimiento?\nEjemplo: 14/08/1995";
+  }
   if (next === "motivo") return "Muy bien 😊 ¿Me dices brevemente el motivo de la consulta?";
   return null;
 }
@@ -916,9 +1228,11 @@ function looksLikeRealName(text) {
     "pero",
     "motivo",
     "informacion",
+    "información",
     "pregunta",
     "mes que viene",
     "proximo mes",
+    "próximo mes",
     "siguiente mes",
     "en 2 semanas",
   ];
@@ -999,7 +1313,7 @@ function extractData(state, text, fromPhone) {
   }
 }
 
-// ── NOTIFICACIÓN AL DOCTOR ────────────────────────────────────────────────────
+// ── Notificación / Twilio ─────────────────────────────────────────────────────
 
 async function notifyDoctor(type, state, extra = "") {
   if (
@@ -1066,7 +1380,144 @@ Ya le avisamos que la contactarán.`,
   }
 }
 
-// ── SLOTS ─────────────────────────────────────────────────────────────────────
+async function sendWhatsAppMessage(to, body) {
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM || !to) {
+    console.log("sendWhatsAppMessage pendiente:", { to, body });
+    return false;
+  }
+
+  try {
+    const creds = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+
+    const resp = await fetch(
+      `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Basic ${creds}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: new URLSearchParams({
+          From: TWILIO_FROM,
+          To: to,
+          Body: body,
+        }).toString(),
+      }
+    );
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      console.error("❌ Error enviando follow-up Twilio:", errText);
+      return false;
+    }
+
+    return true;
+  } catch (e) {
+    console.error("sendWhatsAppMessage error:", e);
+    return false;
+  }
+}
+
+// ── Follow-up ─────────────────────────────────────────────────────────────────
+
+function clearFollowUp(state) {
+  if (state?.followUpTimer) {
+    clearTimeout(state.followUpTimer);
+    state.followUpTimer = null;
+  }
+}
+
+function buildFollowUpMessage(state) {
+  if (state.stage === "horario" && state.slots?.length) {
+    return `Hola 😊 Solo retomo tu mensaje por si todavía te gustaría agendar.
+
+Tengo estos horarios disponibles:
+${formatSlots(state.slots)}
+
+Si alguno te queda bien, puedes responder 1, 2 o 3 y te apoyo a apartarlo.`;
+  }
+
+  if (state.stage === "datos") {
+    const next = buildNextDataQuestion(state);
+    return `Hola 😊 Solo retomo tu mensaje para ayudarte a avanzar con tu cita.
+
+${next || "Si gustas, seguimos con tu registro por aquí."}`;
+  }
+
+  if (state.stage === "motivo") {
+    return `Hola 😊 Solo retomo tu mensaje.
+
+Si gustas, dime brevemente el motivo de la consulta y con eso te comparto opciones para agendar.`;
+  }
+
+  if (state.stage === "precio_q") {
+    return `Hola 😊 Solo retomo tu mensaje.
+
+Si me dices si es para revisión general, embarazo, ultrasonido o alguna molestia, te comparto la información completa y los horarios disponibles.`;
+  }
+
+  if (state.stage === "duda") {
+    return `Hola 😊 Solo retomo tu mensaje por si todavía te gustaría que te orientáramos y, si hace falta, ayudarte a agendar una valoración.`;
+  }
+
+  if (state.stage === "idle") {
+    return `Hola 😊 Solo retomo tu mensaje por si todavía te gustaría agendar una cita, pedir información o resolver alguna duda. Estoy al pendiente para ayudarte.`;
+  }
+
+  if (state.stage === "datos_manual" || state.stage === "espera_confirmacion") {
+    return null;
+  }
+
+  if (state.stage === "prioridad" || state.stage === "confirmada") {
+    return null;
+  }
+
+  return `Hola 😊 Solo retomo tu mensaje por si todavía te gustaría agendar o recibir información. Estoy al pendiente para ayudarte.`;
+}
+
+function scheduleFollowUp(state, fromPhone) {
+  clearFollowUp(state);
+
+  if (
+    !fromPhone ||
+    state.stage === "confirmada" ||
+    state.stage === "prioridad" ||
+    state.followUpSent
+  ) {
+    return;
+  }
+
+  state.followUpTimer = setTimeout(async () => {
+    try {
+      const freshState = conversaciones.get(fromPhone);
+      if (!freshState) return;
+      if (freshState.followUpSent) return;
+
+      const inactiveMs = Date.now() - (freshState.lastActivity || 0);
+      if (inactiveMs < FOLLOWUP_DELAY_MS - 5000) return;
+
+      if (freshState.stage === "confirmada" || freshState.stage === "prioridad") return;
+
+      const body = buildFollowUpMessage(freshState);
+      if (!body) return;
+
+      const ok = await sendWhatsAppMessage(fromPhone, body);
+      if (ok) {
+        freshState.followUpSent = true;
+        console.log(`✅ Follow-up enviado a ${fromPhone}`);
+      }
+    } catch (e) {
+      console.error("scheduleFollowUp error:", e);
+    } finally {
+      const freshState = conversaciones.get(fromPhone);
+      if (freshState) {
+        freshState.followUpTimer = null;
+      }
+    }
+  }, FOLLOWUP_DELAY_MS);
+}
+
+// ── Slots ─────────────────────────────────────────────────────────────────────
 
 function formatSlots(slots) {
   return (slots || [])
@@ -1087,13 +1538,31 @@ function detectSlotChoice(msg, cls, slots) {
     .replace(/opcion/g, "")
     .replace(/opción/g, "");
 
-  if (t === "1" || t.startsWith("1 ") || t.startsWith("el 1") || t.includes("primera") || t.includes("primer")) {
+  if (
+    t === "1" ||
+    t.startsWith("1 ") ||
+    t.startsWith("el 1") ||
+    t.includes("primera") ||
+    t.includes("primer")
+  ) {
     return slots[0] || null;
   }
-  if (t === "2" || t.startsWith("2 ") || t.startsWith("el 2") || t.includes("segunda") || t.includes("segundo")) {
+  if (
+    t === "2" ||
+    t.startsWith("2 ") ||
+    t.startsWith("el 2") ||
+    t.includes("segunda") ||
+    t.includes("segundo")
+  ) {
     return slots[1] || null;
   }
-  if (t === "3" || t.startsWith("3 ") || t.startsWith("el 3") || t.includes("tercera") || t.includes("tercer")) {
+  if (
+    t === "3" ||
+    t.startsWith("3 ") ||
+    t.startsWith("el 3") ||
+    t.includes("tercera") ||
+    t.includes("tercer")
+  ) {
     return slots[2] || null;
   }
 
@@ -1146,6 +1615,8 @@ function detectSlotChoice(msg, cls, slots) {
   return null;
 }
 
+// ── Flujo manual / triage ─────────────────────────────────────────────────────
+
 async function pedirDatosYEsperarManual(state) {
   const q = buildNextDataQuestion(state);
   if (q) {
@@ -1170,6 +1641,76 @@ En breve el consultorio te contactará para confirmarte tu horario.
 
 Cualquier duda, aquí seguimos al pendiente 🙂`;
 }
+
+async function resumeAfterBleedingTriage(state) {
+  const pending = state.pendingTriage || {};
+  state.pendingTriage = null;
+
+  const intro = `Gracias por aclararlo 😊
+
+Si es solo manchado y no es abundante, podemos seguir con tu atención de forma normal.`;
+
+  if (pending.returnStage === "datos") {
+    state.stage = "datos";
+    return `${intro}
+
+${buildNextDataQuestion(state) || "¿Me compartes tu nombre completo?"}`;
+  }
+
+  if (pending.returnStage === "horario" && state.slots?.length) {
+    state.stage = "horario";
+    return `${intro}
+
+Tengo estos horarios disponibles:
+${formatSlots(state.slots)}
+
+Dime cuál te queda mejor y te lo aparto.
+Puedes responder 1, 2 o 3.`;
+  }
+
+  if (pending.returnStage === "motivo") {
+    state.stage = "motivo";
+    return `${intro}
+
+¿Me puedes decir brevemente el motivo de la consulta?`;
+  }
+
+  if (pending.returnStage === "precio_q") {
+    state.stage = "precio_q";
+    return `${intro}
+
+¿Es para revisión general, embarazo, ultrasonido o traes alguna molestia en particular?`;
+  }
+
+  if (pending.returnStage === "duda") {
+    state.stage = "duda";
+    return `${intro}
+
+Cuéntame qué está pasando o qué te gustaría revisar, y con gusto te apoyo para orientarte mejor.`;
+  }
+
+  if (pending.wantsAppointment) {
+    if (!state.patient.motivo) {
+      state.stage = "motivo";
+      return `${intro}
+
+¿Me puedes decir brevemente el motivo de la consulta?`;
+    }
+
+    state.stage = "horario";
+    const horarios = await ofrecerHorarios(state, state.datePreference || null);
+    return `${intro}
+
+${horarios}`;
+  }
+
+  state.stage = "idle";
+  return `${intro}
+
+¿Te gustaría agendar una cita o que te comparta información?`;
+}
+
+// ── Horarios / agenda ─────────────────────────────────────────────────────────
 
 async function ofrecerHorarios(state, datePreference = null) {
   if (!huliDisponible()) {
@@ -1198,7 +1739,8 @@ async function ofrecerHorarios(state, datePreference = null) {
 Lo más próximo que tengo es:
 ${formatSlots(state.slots)}
 
-Dime cuál te queda mejor y te ayudo a apartarlo.`;
+Dime cuál te queda mejor y te lo aparto.
+Puedes responder 1, 2 o 3.`;
         }
 
         state.stage = "datos_manual";
@@ -1282,7 +1824,8 @@ async function ofrecerHorariosAlternativos(state, msg, cls) {
       return `Claro 😊 También tengo estas opciones:
 ${formatSlots(state.slots)}
 
-Dime cuál te funciona mejor y te lo aparto.`;
+Dime cuál te funciona mejor y te lo aparto.
+Puedes responder 1, 2 o 3.`;
     }
 
     allSlots = await huliGetSlotsInRange(new Date(), (() => {
@@ -1298,7 +1841,8 @@ Dime cuál te funciona mejor y te lo aparto.`;
       return `Claro 😊 Un poco más adelante tengo:
 ${formatSlots(state.slots)}
 
-Dime cuál te queda mejor y avanzamos con el registro.`;
+Dime cuál te queda mejor y avanzamos con el registro.
+Puedes responder 1, 2 o 3.`;
     }
 
     state.stage = "datos_manual";
@@ -1343,6 +1887,8 @@ async function agendarCita(state) {
       notifyDoctor("CITA_HULI", state).catch(console.error);
     }
 
+    clearFollowUp(state);
+
     return `Listo, tu cita quedó registrada 😊
 
 📅 ${slot.date_l10n} a las ${slot.time_l10n}
@@ -1365,14 +1911,24 @@ En breve el consultorio te contactará para confirmarte tu horario exacto.`;
   }
 }
 
-// ── ROUTER PRINCIPAL ──────────────────────────────────────────────────────────
+// ── Router principal ──────────────────────────────────────────────────────────
 
 async function route(state, msg, fromPhone, cls) {
   state.lastIncomingText = msg;
+  state.lastActivity = Date.now();
+
+  let intro = "";
+  if (state.isNew) {
+    intro = buildIntroPrefix(state);
+    state.isNew = false;
+  }
+
   extractData(state, msg, fromPhone);
 
   if (cls?.patient_name && !state.patient.nombre) state.patient.nombre = cls.patient_name.trim();
-  if (cls?.patient_dob && !state.patient.fechaNacimiento) state.patient.fechaNacimiento = cls.patient_dob.trim();
+  if (cls?.patient_dob && !state.patient.fechaNacimiento) {
+    state.patient.fechaNacimiento = cls.patient_dob.trim();
+  }
   if (cls?.patient_reason && !state.patient.motivo) state.patient.motivo = cls.patient_reason.trim();
   if (cls?.preferred_schedule) state.manualPreference = cls.preferred_schedule;
 
@@ -1382,26 +1938,117 @@ async function route(state, msg, fromPhone, cls) {
 
   if (datePref) state.datePreference = datePref;
 
+  const menuOption = detectWelcomeMenuOption(msg);
+
+  if (state.stage === "triage_sangrado") {
+    const severity = detectBleedingSeverity(msg);
+
+    if (severity === "abundante") {
+      state.stage = "prioridad";
+      clearFollowUp(state);
+      notifyDoctor("URGENCIA", state, `Posible sangrado de alarma. Mensaje: ${msg}`).catch(
+        console.error
+      );
+
+      return `${intro}Gracias por decírmelo 🙏
+
+Por lo que me comentas, sí puede ser un dato de alarma y lo ideal es que el doctor lo valore lo antes posible.
+
+Si prefieres, lo notifico directamente para que se dé seguimiento prioritario.
+También me puedes decir si presentas dolor fuerte, mareo o coágulos.`;
+    }
+
+    if (severity === "leve") {
+      return await resumeAfterBleedingTriage(state);
+    }
+
+    return `${intro}Para orientarte bien, necesito saber si es algo urgente 🙏
+
+¿Es:
+1️⃣ Sangrado abundante
+2️⃣ Solo manchado / manchón?`;
+  }
+
+  if (shouldAskBleedingTriage(state, msg)) {
+    state.pendingTriage = {
+      returnStage: state.stage,
+      wantsAppointment:
+        !!cls?.wants_appointment ||
+        wantsAppointment(msg) ||
+        ["motivo", "horario", "datos"].includes(state.stage),
+    };
+
+    state.stage = "triage_sangrado";
+
+    return `${intro}Antes de seguir, necesito ubicar si es algo urgente 🙏
+
+¿El sangrado es abundante o es solo manchado?
+
+Puedes responder:
+1️⃣ Sangrado abundante
+2️⃣ Solo manchado / manchón`;
+  }
+
   if (isPriority(msg) || cls?.is_priority || wantsDoctorDirect(msg) || cls?.wants_doctor_direct) {
     state.stage = "prioridad";
+    clearFollowUp(state);
     notifyDoctor("URGENCIA", state, msg).catch(console.error);
-    return `Por lo que me comentas es importante que el doctor lo valore directamente 🙏
+    return `${intro}Por lo que me comentas es importante que el doctor lo valore directamente 🙏
 
 En un momento te apoyamos para darte atención prioritaria.
 Si puedes, cuéntame brevemente cómo te sientes.`;
   }
 
+  if (state.stage === "idle" && menuOption) {
+    switch (menuOption) {
+      case 1:
+        if (!state.patient.motivo) {
+          state.stage = "motivo";
+          return `${intro}Claro 😊
+
+¿Me puedes decir brevemente el motivo de la consulta?`;
+        }
+        state.stage = "horario";
+        return `${intro}${await ofrecerHorarios(state, state.datePreference || null)}`;
+
+      case 2:
+        state.flags.pidioPrecio = true;
+        state.stage = "precio_q";
+        return `${intro}Claro 😊 con gusto te apoyo.
+
+¿Es para revisión general, embarazo, ultrasonido o traes alguna molestia en particular?`;
+
+      case 3:
+        state.stage = "duda";
+        return `${intro}Claro 😊
+
+Cuéntame qué está pasando o qué te gustaría revisar, y con gusto te apoyo para orientarte mejor.`;
+
+      case 4:
+        state.stage = "prioridad";
+        clearFollowUp(state);
+        notifyDoctor("URGENCIA", state, msg).catch(console.error);
+        return `${intro}Por lo que me comentas es importante valorarlo directamente 🙏
+
+En un momento te apoyamos para darte atención prioritaria.
+Si puedes, cuéntame brevemente qué está pasando.`;
+
+      case 5:
+        return buildDoctorIdentityReply(state);
+    }
+  }
+
   if (state.stage === "idle" && (asksIfDoctor(msg) || cls?.asks_if_doctor)) {
-    return buildDoctorIdentityReply();
+    return state.isNew ? buildDoctorIdentityReply(state) : buildDoctorIdentityReply();
   }
 
   if (state.stage === "idle" && isJustGreeting(msg)) {
-    return buildWelcomeMessage();
+    return buildWelcomeMessage(state);
   }
 
   if (state.stage === "idle" && (wantsInfo(msg) || cls?.wants_info)) {
     state.stage = "duda";
-    return `Claro 😊
+    return `${intro}Claro 😊
 
 Cuéntame qué está pasando o qué te gustaría revisar, y con gusto te apoyo para orientarte mejor.`;
   }
@@ -1413,6 +2060,8 @@ Cuéntame qué está pasando o qué te gustaría revisar, y con gusto te apoyo p
       state.slots = [];
       state.chosenSlot = null;
       state.patient.motivo = "";
+      state.followUpSent = false;
+      state.pendingTriage = null;
     } else {
       return `Tu cita ya quedó confirmada 😊
 
@@ -1424,25 +2073,25 @@ Si necesitas cambiar el horario o tienes alguna duda, aquí puedo ayudarte.`;
     if (wantsAppointment(msg) || cls?.wants_appointment) {
       if (!state.patient.motivo) {
         state.stage = "motivo";
-        return `Claro, con gusto te ayudo a agendar 😊
+        return `${intro}Claro, con gusto te ayudo a agendar 😊
 
 ¿Me dices brevemente el motivo de la consulta?`;
       }
       state.stage = "horario";
-      return await ofrecerHorarios(state, state.datePreference || null);
+      return `${intro}${await ofrecerHorarios(state, state.datePreference || null)}`;
     }
 
     if (wantsPrice(msg) || cls?.wants_price) {
       state.flags.yaDimosPrecio = true;
       state.stage = "horario";
-      return await ofrecerPrecioYHorarios(state, state.datePreference || null);
+      return `${intro}${await ofrecerPrecioYHorarios(state, state.datePreference || null)}`;
     }
 
     if (isGreeting(msg)) {
-      return "Claro 😊 Cuéntame tu duda o qué síntomas tienes, y con gusto te apoyo.";
+      return `${intro}Claro 😊 Cuéntame tu duda o qué síntomas tienes, y con gusto te apoyo.`;
     }
 
-    return await answerMedicalDoubt(state, msg);
+    return `${intro}${await answerMedicalDoubt(state, msg)}`;
   }
 
   if (state.stage === "espera_confirmacion") {
@@ -1452,7 +2101,7 @@ Si necesitas cambiar el horario o tienes alguna duda, aquí puedo ayudarte.`;
   if (state.stage === "datos_manual") {
     if (wantsPrice(msg) || cls?.wants_price) {
       state.flags.yaDimosPrecio = true;
-      return `Claro 😊
+      return `${intro}Claro 😊
 
 La consulta incluye valoración completa y ultrasonido.
 
@@ -1462,14 +2111,14 @@ ${buildNextDataQuestion(state) || ""}`;
     }
 
     const q = buildNextDataQuestion(state);
-    if (q) return q;
+    if (q) return `${intro}${q}`;
     return await confirmarEsperaManual(state);
   }
 
   if ((wantsPrice(msg) || cls?.wants_price) && !state.flags.pidioPrecio && !state.patient.motivo) {
     state.flags.pidioPrecio = true;
     state.stage = "precio_q";
-    return `Claro 😊 con gusto te apoyo.
+    return `${intro}Claro 😊 con gusto te apoyo.
 
 ¿Es para revisión general, embarazo, ultrasonido o traes alguna molestia en particular?`;
   }
@@ -1477,24 +2126,24 @@ ${buildNextDataQuestion(state) || ""}`;
   if ((wantsPrice(msg) || cls?.wants_price) && !state.flags.yaDimosPrecio && state.patient.motivo) {
     state.flags.yaDimosPrecio = true;
     state.stage = "horario";
-    return await ofrecerPrecioYHorarios(state, state.datePreference || null);
+    return `${intro}${await ofrecerPrecioYHorarios(state, state.datePreference || null)}`;
   }
 
   if (state.stage === "precio_q" && msg.trim().length > 2 && !isGreeting(msg)) {
     if (!state.patient.motivo) state.patient.motivo = msg.trim().slice(0, 200);
     state.flags.yaDimosPrecio = true;
     state.stage = "horario";
-    return await ofrecerPrecioYHorarios(state, state.datePreference || null);
+    return `${intro}${await ofrecerPrecioYHorarios(state, state.datePreference || null)}`;
   }
 
   if (state.stage === "motivo") {
     if (!isGreeting(msg) && msg.trim().length > 2) {
       if (!state.patient.motivo) state.patient.motivo = msg.trim().slice(0, 200);
       state.stage = "horario";
-      return await ofrecerHorarios(state, state.datePreference || null);
+      return `${intro}${await ofrecerHorarios(state, state.datePreference || null)}`;
     }
 
-    return `Con gusto 😊
+    return `${intro}Con gusto 😊
 
 ¿Me puedes decir brevemente el motivo de la consulta?`;
   }
@@ -1502,13 +2151,13 @@ ${buildNextDataQuestion(state) || ""}`;
   if (state.stage === "horario") {
     if (datePref) {
       state.datePreference = datePref;
-      return await ofrecerHorarios(state, datePref);
+      return `${intro}${await ofrecerHorarios(state, datePref)}`;
     }
 
     const requestedDay = detectRequestedWeekday(msg);
     if (requestedDay) {
       const dayReply = buildRequestedWeekdayReply(requestedDay);
-      return `${dayReply}
+      return `${intro}${dayReply}
 
 ${formatSlots(state.slots)}
 
@@ -1517,7 +2166,7 @@ Puedes responder 1, 2 o 3.`;
     }
 
     if (cantMakeIt(msg) || cls?.cant_make_it) {
-      return await ofrecerHorariosAlternativos(state, msg, cls);
+      return `${intro}${await ofrecerHorariosAlternativos(state, msg, cls)}`;
     }
 
     const chosen = detectSlotChoice(msg, cls, state.slots);
@@ -1527,66 +2176,80 @@ Puedes responder 1, 2 o 3.`;
       const next = buildNextDataQuestion(state);
       if (next) {
         state.stage = "datos";
-        return `Perfecto, te aparto el ${chosen.date_l10n} a las ${chosen.time_l10n} 😊
+        return `${intro}Perfecto, te aparto el ${chosen.date_l10n} a las ${chosen.time_l10n} 😊
 
 ${next}`;
       }
 
-      return await agendarCita(state);
+      return `${intro}${await agendarCita(state)}`;
     }
 
     if (
-      ["si", "sí", "ok", "va", "si esta bien", "sí está bien", "esta bien", "está bien"].includes(normalizeText(msg))
+      ["si", "sí", "ok", "va", "si esta bien", "sí está bien", "esta bien", "está bien"].includes(
+        normalizeText(msg)
+      )
     ) {
-      return `Perfecto 😊 Solo dime cuál horario te queda mejor:
+      return `${intro}Perfecto 😊 Solo dime cuál horario te queda mejor:
 ${formatSlots(state.slots)}
 
 Respóndeme 1, 2 o 3.`;
     }
 
-    return `Con gusto 😊 Solo confirma cuál horario te queda mejor:
+    return `${intro}Con gusto 😊 Solo confirma cuál horario te queda mejor:
 ${formatSlots(state.slots)}
 
 Respóndeme 1, 2 o 3, o escríbeme la hora que prefieras.`;
   }
 
+  if (
+    ["motivo", "horario", "datos"].includes(state.stage) &&
+    (wantsInfo(msg) || cls?.wants_info)
+  ) {
+    return `${intro}Sí te puede valorar el doctor 😊
+
+Para orientarte mejor, lo ideal es revisarte en consulta.
+
+Seguimos con tu registro para apartarte el espacio.
+${buildNextDataQuestion(state) || "¿Me compartes tu nombre completo?"}`;
+  }
+
   if (state.stage === "datos") {
     const q = buildNextDataQuestion(state);
-    if (q) return q;
-    return await agendarCita(state);
+    if (q) return `${intro}${q}`;
+    return `${intro}${await agendarCita(state)}`;
   }
 
   if (wantsAppointment(msg) || cls?.wants_appointment) {
     if (datePref && !state.patient.motivo) {
       state.stage = "motivo";
-      return `Claro, con gusto te ayudo a agendar para ${datePref.text} 😊
+      return `${intro}Claro, con gusto te ayudo a agendar para ${datePref.text} 😊
 
 ¿Me puedes decir brevemente el motivo de la consulta?`;
     }
 
     if (!state.patient.motivo) {
       state.stage = "motivo";
-      return `Claro, con gusto te ayudo a agendar 😊
+      return `${intro}Claro, con gusto te ayudo a agendar 😊
 
 ¿Me puedes decir brevemente el motivo de la consulta?`;
     }
 
     state.stage = "horario";
-    return await ofrecerHorarios(state, state.datePreference || null);
+    return `${intro}${await ofrecerHorarios(state, state.datePreference || null)}`;
   }
 
   if (!OPENAI_API_KEY) {
-    return "Claro 😊 Soy el asistente del Dr. Ricardo Cid Trejo. ¿En qué te puedo apoyar?";
+    return `${intro}Claro 😊 Soy el asistente del Dr. Ricardo Cid Trejo. ¿En qué te puedo apoyar?`;
   }
 
   try {
-    return await writerReply(state, msg);
+    return `${intro}${await writerReply(state, msg)}`;
   } catch {
-    return "Claro 😊 Soy el asistente del Dr. Ricardo Cid Trejo. Cuéntame cómo te puedo apoyar.";
+    return `${intro}Claro 😊 Soy el asistente del Dr. Ricardo Cid Trejo. Cuéntame cómo te puedo apoyar.`;
   }
 }
 
-// ── SERVIDOR ──────────────────────────────────────────────────────────────────
+// ── Servidor ──────────────────────────────────────────────────────────────────
 
 const server = createServer(async (req, res) => {
   try {
@@ -1598,28 +2261,70 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "GET" && req.url === "/health") {
       res.writeHead(200, { "Content-Type": "application/json;charset=utf-8" });
-      res.end(JSON.stringify({
-        ok: true,
-        huli: huliDisponible(),
-        conversaciones: conversaciones.size,
-        uptime: Math.floor(process.uptime()),
-      }));
+      res.end(
+        JSON.stringify({
+          ok: true,
+          huli: huliDisponible(),
+          conversaciones: conversaciones.size,
+          uptime: Math.floor(process.uptime()),
+        })
+      );
       return;
     }
 
     if (req.method === "POST" && (req.url === "/whatsapp" || req.url === "/whatsapp/")) {
       const body = await readBody(req);
       const params = new URLSearchParams(body);
+
       const msg = (params.get("Body") || "").trim();
       const fromPhone = params.get("From") || "desconocido";
       const messageSid = params.get("MessageSid") || "";
 
-      console.log(`[${new Date().toISOString()}] From:${fromPhone} Sid:${messageSid} Msg:${msg}`);
+      const profileName = params.get("ProfileName") || "";
+      const referralHeadline = params.get("ReferralHeadline") || "";
+      const referralSourceId = params.get("ReferralSourceId") || "";
+      const referralSourceUrl = params.get("ReferralSourceUrl") || "";
+      const referralCtwaClid = params.get("ReferralCtwaClid") || "";
+
+      console.log(
+        `[${new Date().toISOString()}] From:${fromPhone} Sid:${messageSid} Msg:${msg}`
+      );
 
       const state = getConv(fromPhone);
 
+      state.source.profileName = profileName || state.source.profileName || "";
+      state.source.referralHeadline =
+        referralHeadline || state.source.referralHeadline || "";
+      state.source.referralSourceId =
+        referralSourceId || state.source.referralSourceId || "";
+      state.source.referralSourceUrl =
+        referralSourceUrl || state.source.referralSourceUrl || "";
+      state.source.referralCtwaClid =
+        referralCtwaClid || state.source.referralCtwaClid || "";
+      state.source.isCtwaAd = !!(
+        state.source.referralSourceId ||
+        state.source.referralHeadline ||
+        state.source.referralCtwaClid
+      );
+
+      if (state.isNew && !state.knownPatientName) {
+        await enrichKnownPatientName(state, fromPhone);
+      }
+
+      console.log(
+        "META:",
+        JSON.stringify({
+          profileName,
+          isCtwaAd: state.source.isCtwaAd,
+          referralHeadline,
+          referralSourceId,
+          referralCtwaClid,
+          knownPatientName: state.knownPatientName,
+        })
+      );
+
       if (!msg) {
-        const xml = twiml(buildWelcomeMessage());
+        const xml = twiml(buildWelcomeMessage(state));
         res.writeHead(200, {
           "Content-Type": "text/xml;charset=utf-8",
           "Content-Length": Buffer.byteLength(xml),
@@ -1638,7 +2343,10 @@ const server = createServer(async (req, res) => {
       console.log("CLS:", JSON.stringify(cls));
 
       const reply = await route(state, msg, fromPhone, cls);
-      console.log(`[Stage:${state.stage}] Reply:${reply.slice(0, 120)}`);
+      console.log(`[Stage:${state.stage}] Reply:${reply.slice(0, 220)}`);
+
+      clearFollowUp(state);
+      scheduleFollowUp(state, fromPhone);
 
       const xml = twiml(reply);
       res.writeHead(200, {
@@ -1653,7 +2361,9 @@ const server = createServer(async (req, res) => {
     res.end("Not found");
   } catch (err) {
     console.error("SERVER ERROR:", err);
-    const fallback = twiml("Hola 😊 Tuvimos una falla temporal. ¿Te ayudo a revisar los horarios disponibles?");
+    const fallback = twiml(
+      "Hola 😊 Tuvimos una falla temporal. ¿Te ayudo a revisar los horarios disponibles?"
+    );
     res.writeHead(200, {
       "Content-Type": "text/xml;charset=utf-8",
       "Content-Length": Buffer.byteLength(fallback),
